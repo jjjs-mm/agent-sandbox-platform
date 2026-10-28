@@ -30,6 +30,7 @@ from ..models.programmatic import (
 from .interfaces import FileServiceInterface
 from .sandbox.manager import SandboxManager
 from .sandbox.nsjail import NsjailConfig, SandboxInfo
+from .tenant_quota import TenantQuotaLease, TenantQuotaService
 
 logger = structlog.get_logger(__name__)
 
@@ -57,6 +58,7 @@ class PausedContext:
     accumulated_stderr: str = ""
     execution_deadline: float = 0.0
     execution_timeout_seconds: int = 0
+    quota_lease: Optional[TenantQuotaLease] = None
 
 
 class ProgrammaticService:
@@ -70,11 +72,18 @@ class ProgrammaticService:
         self,
         sandbox_manager: Optional[SandboxManager] = None,
         file_service: Optional[FileServiceInterface] = None,
+        tenant_quota_service: Optional[TenantQuotaService] = None,
     ):
         self._sandbox_manager = sandbox_manager or SandboxManager()
         self._nsjail_config = NsjailConfig()
         self._paused_contexts: Dict[str, PausedContext] = {}
         self._file_service = file_service
+        self._tenant_quota_service = tenant_quota_service or TenantQuotaService()
+
+    def get_paused_session_id(self, continuation_token: str) -> Optional[str]:
+        """Return the session bound to a live continuation token, if any."""
+        context = self._paused_contexts.get(continuation_token)
+        return context.session_id if context else None
 
     async def start_execution(
         self,
@@ -84,6 +93,7 @@ class ProgrammaticService:
         timeout: Optional[int] = None,
         files: Optional[List[PTCFileInput]] = None,
         lang: str = "py",
+        tenant_id: str = "default",
     ) -> ProgrammaticExecResponse:
         """Start a new PTC execution.
 
@@ -112,16 +122,21 @@ class ProgrammaticService:
 
         execution_timeout = timeout or settings.max_execution_time
         execution_deadline = time.monotonic() + execution_timeout
-
-        # Bash PTC sandbox runs as the bash uid; python PTC sandbox runs as py.
-        sandbox_language = lang
-        sandbox_info = self._sandbox_manager.create_sandbox(
-            session_id=session_id,
-            language=sandbox_language,
-            repl_mode=False,
+        quota_lease = await self._tenant_quota_service.acquire(
+            tenant_id=tenant_id,
+            requested_timeout_seconds=execution_timeout,
         )
+        quota_ownership_transferred = False
 
+        sandbox_info = None
         try:
+            # Bash PTC sandbox runs as the bash uid; Python PTC runs as py.
+            sandbox_language = lang
+            sandbox_info = self._sandbox_manager.create_sandbox(
+                session_id=session_id,
+                language=sandbox_language,
+                repl_mode=False,
+            )
             ptc_server_filename = (
                 "ptc_bash_server.py" if lang == "bash" else "ptc_server.py"
             )
@@ -244,6 +259,7 @@ class ProgrammaticService:
             await proc.stdin.drain()
 
             # Read response from ptc_server
+            quota_ownership_transferred = True
             return await self._read_ptc_response(
                 proc=proc,
                 sandbox_info=sandbox_info,
@@ -252,11 +268,13 @@ class ProgrammaticService:
                 execution_deadline=execution_deadline,
                 execution_timeout_seconds=execution_timeout,
                 lang=lang,
+                quota_lease=quota_lease,
             )
 
         except Exception as e:
             # Cleanup sandbox on error
-            self._sandbox_manager.destroy_sandbox(sandbox_info)
+            if sandbox_info is not None:
+                self._sandbox_manager.destroy_sandbox(sandbox_info)
             logger.error(
                 "PTC execution failed",
                 session_id=session_id[:12],
@@ -267,6 +285,9 @@ class ProgrammaticService:
                 session_id=session_id,
                 error=f"Execution failed: {str(e)}",
             )
+        finally:
+            if not quota_ownership_transferred:
+                await self._tenant_quota_service.release(quota_lease)
 
     async def continue_execution(
         self,
@@ -355,10 +376,12 @@ class ProgrammaticService:
                 accumulated_stderr=ctx.accumulated_stderr,
                 round_trip_count=ctx.round_trip_count,
                 lang=ctx.lang,
+                quota_lease=ctx.quota_lease,
             )
 
         except Exception as e:
-            await self._cleanup_paused_context(continuation_token)
+            self._paused_contexts.pop(continuation_token, None)
+            await self._cleanup_context(ctx)
             logger.error(
                 "PTC continuation failed",
                 continuation_token=continuation_token[:12],
@@ -382,6 +405,7 @@ class ProgrammaticService:
         accumulated_stderr: str = "",
         round_trip_count: int = 0,
         lang: str = "py",
+        quota_lease: Optional[TenantQuotaLease] = None,
     ) -> ProgrammaticExecResponse:
         """Read and process a response from the PTC server subprocess.
 
@@ -399,6 +423,7 @@ class ProgrammaticService:
         Returns:
             ProgrammaticExecResponse
         """
+        lease_stored_for_continuation = False
         try:
             # Read stdout until we get a complete PTC message
             stdout_buf = ""
@@ -517,6 +542,7 @@ class ProgrammaticService:
                     accumulated_stderr=total_stderr,
                     execution_deadline=execution_deadline,
                     execution_timeout_seconds=execution_timeout_seconds,
+                    quota_lease=quota_lease,
                 )
 
                 # Set timeout for cleanup
@@ -528,12 +554,20 @@ class ProgrammaticService:
 
                     return _cb
 
+                cleanup_delay = max(
+                    0.1,
+                    min(
+                        PTC_PAUSE_TIMEOUT,
+                        execution_deadline - time.monotonic(),
+                    ),
+                )
                 ctx.timeout_handle = loop.call_later(
-                    PTC_PAUSE_TIMEOUT,
+                    cleanup_delay,
                     _make_cleanup_callback(token),
                 )
 
                 self._paused_contexts[token] = ctx
+                lease_stored_for_continuation = True
 
                 return ProgrammaticExecResponse(
                     status="tool_call_required",
@@ -594,6 +628,9 @@ class ProgrammaticService:
                 stdout=accumulated_stdout,
                 stderr=accumulated_stderr,
             )
+        finally:
+            if quota_lease is not None and not lease_stored_for_continuation:
+                await self._tenant_quota_service.release(quota_lease)
 
     async def _mount_requested_files(
         self,
@@ -685,6 +722,17 @@ class ProgrammaticService:
         if ctx is None:
             return
 
+        await self._cleanup_context(ctx)
+
+        logger.debug(
+            "Cleaned up paused PTC context",
+            token=token[:12],
+            session_id=ctx.session_id[:12],
+        )
+
+    async def _cleanup_context(self, ctx: PausedContext) -> None:
+        """Release every resource owned by a detached paused context."""
+
         if ctx.timeout_handle:
             ctx.timeout_handle.cancel()
 
@@ -695,11 +743,10 @@ class ProgrammaticService:
             pass
 
         self._sandbox_manager.destroy_sandbox(ctx.sandbox_info)
-        logger.debug(
-            "Cleaned up paused PTC context",
-            token=token[:12],
-            session_id=ctx.session_id[:12],
-        )
+        if ctx.quota_lease is not None:
+            quota_lease = ctx.quota_lease
+            ctx.quota_lease = None
+            await self._tenant_quota_service.release(quota_lease)
 
     async def cleanup_all(self) -> None:
         """Clean up all paused PTC contexts. Called during shutdown."""

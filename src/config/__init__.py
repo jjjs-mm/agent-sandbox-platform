@@ -92,6 +92,29 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = Field(
         default=True, description="Enable per-key rate limiting for Redis-managed keys"
     )
+    tenant_quota_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable aggregate execution quotas shared by every API key that "
+            "belongs to the same tenant"
+        ),
+    )
+    tenant_max_concurrent_executions: int = Field(
+        default=4,
+        ge=1,
+        le=1000,
+        description="Maximum concurrent executions for one tenant",
+    )
+    tenant_daily_execution_limit: int = Field(
+        default=1000,
+        ge=1,
+        description="Maximum executions per UTC day for one tenant",
+    )
+    tenant_daily_execution_seconds: int = Field(
+        default=3600,
+        ge=1,
+        description="Maximum measured wall-clock execution seconds per UTC day",
+    )
     auth_enabled: bool = Field(
         default=True,
         description=(
@@ -221,6 +244,28 @@ class Settings(BaseSettings):
     sandbox_pool_exhaustion_trigger: bool = Field(
         default=True,
         description="Trigger immediate replenishment when pool is exhausted",
+    )
+    sandbox_pool_adaptive_enabled: bool = Field(
+        default=False,
+        description="Defer replenishment under load and scale the target from recent misses",
+    )
+    sandbox_pool_adaptive_max_size: int = Field(
+        default=8,
+        ge=1,
+        le=50,
+        description="Maximum Python pool target when adaptive replenishment is enabled",
+    )
+    sandbox_pool_adaptive_miss_window_seconds: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description="Recent miss window used to increase the adaptive target",
+    )
+    sandbox_pool_replenish_max_active: int = Field(
+        default=1,
+        ge=0,
+        le=50,
+        description="Do not replenish while more than this many sandboxes are in use",
     )
 
     # REPL Configuration - Pre-warmed Python interpreter for sub-100ms execution

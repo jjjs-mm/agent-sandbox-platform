@@ -38,6 +38,7 @@ class LoadTestRunner:
         self.monitor = ResourceMonitor(
             sample_interval=config.monitor_interval_seconds,
             enable_sandbox_stats=config.enable_sandbox_stats,
+            docker_container=config.server_container,
         )
         self.progress_callback = progress_callback or (lambda x: None)
 
@@ -57,7 +58,9 @@ class LoadTestRunner:
         self._log(f"Warming up API with {self.config.warmup_requests} requests...")
         successful = await self.client.warmup(language, self.config.warmup_requests)
         success = successful == self.config.warmup_requests
-        self._log(f"Warmup complete: {successful}/{self.config.warmup_requests} successful")
+        self._log(
+            f"Warmup complete: {successful}/{self.config.warmup_requests} successful"
+        )
         return success
 
     async def run_scenario_at_concurrency(
@@ -71,6 +74,8 @@ class LoadTestRunner:
             concurrency=concurrency,
             scenario_id=scenario.id,
         )
+
+        pool_before = await self.client.get_pool_metrics()
 
         # Start monitoring
         await self.monitor.start()
@@ -105,9 +110,31 @@ class LoadTestRunner:
                 error_key = str(exec_result)[:50]
                 result.errors[error_key] = result.errors.get(error_key, 0) + 1
             elif exec_result.success:
+                if exec_result.container_source:
+                    result.container_sources[exec_result.container_source] = (
+                        result.container_sources.get(exec_result.container_source, 0)
+                        + 1
+                    )
+                    result.container_source_latencies.setdefault(
+                        exec_result.container_source, []
+                    ).append(exec_result.latency_ms)
+                result.status_codes[exec_result.status_code] = (
+                    result.status_codes.get(exec_result.status_code, 0) + 1
+                )
                 result.successful_requests += 1
                 result.latencies.append(exec_result.latency_ms)
             else:
+                if exec_result.container_source:
+                    result.container_sources[exec_result.container_source] = (
+                        result.container_sources.get(exec_result.container_source, 0)
+                        + 1
+                    )
+                    result.container_source_latencies.setdefault(
+                        exec_result.container_source, []
+                    ).append(exec_result.latency_ms)
+                result.status_codes[exec_result.status_code] = (
+                    result.status_codes.get(exec_result.status_code, 0) + 1
+                )
                 result.failed_requests += 1
                 error_key = (exec_result.error or "Unknown error")[:50]
                 result.errors[error_key] = result.errors.get(error_key, 0) + 1
@@ -115,8 +142,76 @@ class LoadTestRunner:
         result.duration_seconds = end_time - start_time
         result.system_metrics = system_metrics
         result.sandbox_stats = sandbox_stats
+        pool_after = await self.client.get_pool_metrics()
+        if "error" not in pool_before and "error" not in pool_after:
+            result.pool_hits = max(
+                0,
+                int(pool_after.get("pool_hits", 0))
+                - int(pool_before.get("pool_hits", 0)),
+            )
+            result.pool_misses = max(
+                0,
+                int(pool_after.get("pool_misses", 0))
+                - int(pool_before.get("pool_misses", 0)),
+            )
+            result.pool_exhaustion_events = max(
+                0,
+                int(pool_after.get("exhaustion_events", 0))
+                - int(pool_before.get("exhaustion_events", 0)),
+            )
 
         return result
+
+    async def run_health_baseline(
+        self,
+        concurrency: int,
+        num_requests: int,
+    ) -> ScenarioSummary:
+        """Measure HTTP/control-plane overhead without starting sandboxes."""
+        result = ConcurrencyTestResult(
+            concurrency=concurrency,
+            scenario_id="health_baseline",
+        )
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def bounded_probe() -> ExecutionResult:
+            async with semaphore:
+                return await self.client.probe_health()
+
+        await self.monitor.start()
+        started_at = time.perf_counter()
+        probes = await asyncio.gather(
+            *(bounded_probe() for _ in range(num_requests)),
+            return_exceptions=True,
+        )
+        result.duration_seconds = time.perf_counter() - started_at
+        result.system_metrics = await self.monitor.stop()
+
+        for probe in probes:
+            result.total_requests += 1
+            if isinstance(probe, Exception):
+                result.failed_requests += 1
+                error_key = str(probe)[:50]
+                result.errors[error_key] = result.errors.get(error_key, 0) + 1
+                continue
+            result.status_codes[probe.status_code] = (
+                result.status_codes.get(probe.status_code, 0) + 1
+            )
+            result.latencies.append(probe.latency_ms)
+            if probe.success:
+                result.successful_requests += 1
+            else:
+                result.failed_requests += 1
+                error_key = (probe.error or "Unknown error")[:50]
+                result.errors[error_key] = result.errors.get(error_key, 0) + 1
+
+        return ScenarioSummary(
+            scenario_id="health_baseline",
+            scenario_name="Health Endpoint Baseline",
+            category="control",
+            language="http",
+            results=[result],
+        )
 
     async def run_ramp_up_test(
         self,
@@ -221,7 +316,9 @@ class LoadTestRunner:
         )
 
         for i, (concurrency, duration) in enumerate(steps):
-            self._log(f"  Step {i + 1}/{len(steps)}: concurrency={concurrency}, duration={duration}s")
+            self._log(
+                f"  Step {i + 1}/{len(steps)}: concurrency={concurrency}, duration={duration}s"
+            )
 
             step_summary = await self.run_sustained_test(
                 scenario=scenario,
@@ -249,9 +346,7 @@ class LoadTestRunner:
             elif test_type == "sustained":
                 concurrency = kwargs.get("concurrency", 10)
                 duration = kwargs.get("duration_seconds", 60)
-                summary = await self.run_sustained_test(
-                    scenario, concurrency, duration
-                )
+                summary = await self.run_sustained_test(scenario, concurrency, duration)
             elif test_type == "quick":
                 # Quick test: just one concurrency level
                 summary = ScenarioSummary(
@@ -282,7 +377,9 @@ class LoadTestRunner:
 
         self._log(f"Starting full test suite: {test_id}")
         self._log(f"Scenarios: {len(scenarios)}")
-        self._log(f"Concurrency range: {self.config.min_concurrency}-{self.config.max_concurrency}")
+        self._log(
+            f"Concurrency range: {self.config.min_concurrency}-{self.config.max_concurrency}"
+        )
 
         start_time = datetime.now(timezone.utc)
 
@@ -295,6 +392,7 @@ class LoadTestRunner:
         overall_monitor = ResourceMonitor(
             sample_interval=self.config.monitor_interval_seconds,
             enable_sandbox_stats=self.config.enable_sandbox_stats,
+            docker_container=self.config.server_container,
         )
         await overall_monitor.start()
 

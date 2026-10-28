@@ -128,3 +128,17 @@ def fib(n):
 result = fib(10000 + {iteration})
 print(f'Iteration {iteration}: fib={{str(result)[:50]}}...')
 """
+
+
+class QuotaHoldScenario(BaseScenario):
+    """Hold an execution slot long enough to verify quota rejection."""
+
+    id = "quota_hold"
+    name = "Tenant Quota Hold"
+    description = "Sleep for one second to create overlapping executions"
+    category = "control"
+    language = "py"
+    expected_latency_range = (1000, 3000)
+
+    def get_code(self, iteration: int = 0) -> str:
+        return f"import time; time.sleep(1); print('quota iteration {iteration}')"

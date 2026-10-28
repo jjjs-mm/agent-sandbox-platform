@@ -8,14 +8,18 @@ import math
 from typing import Optional
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 
 from ..models.programmatic import (
     ProgrammaticExecRequest,
     ProgrammaticExecResponse,
 )
 from ..services.programmatic import ProgrammaticService
-from ..dependencies.services import SessionServiceDep, get_file_service
+from ..dependencies.services import (
+    SessionServiceDep,
+    get_file_service,
+    get_tenant_quota_service,
+)
 from ..models import SessionCreate
 from ..utils.id_generator import generate_request_id
 
@@ -30,7 +34,10 @@ def _get_ptc_service() -> ProgrammaticService:
     """Get or create the PTC service singleton."""
     global _ptc_service
     if _ptc_service is None:
-        _ptc_service = ProgrammaticService(file_service=get_file_service())
+        _ptc_service = ProgrammaticService(
+            file_service=get_file_service(),
+            tenant_quota_service=get_tenant_quota_service(),
+        )
     return _ptc_service
 
 
@@ -44,6 +51,7 @@ def _timeout_ms_to_seconds(timeout_ms: Optional[int]) -> Optional[int]:
 @router.post("/exec/programmatic", response_model=ProgrammaticExecResponse)
 async def execute_programmatic(
     request: ProgrammaticExecRequest,
+    http_request: Request,
     session_service: SessionServiceDep,
 ) -> ProgrammaticExecResponse:
     """Execute code with programmatic tool calling support.
@@ -61,9 +69,17 @@ async def execute_programmatic(
     """
     request_id = generate_request_id()[:8]
     ptc_service = _get_ptc_service()
+    tenant_id = getattr(http_request.state, "tenant_id", "default")
 
     # Continuation mode
     if request.continuation_token:
+        paused_session_id = ptc_service.get_paused_session_id(
+            request.continuation_token
+        )
+        if paused_session_id and not await session_service.validate_session_access(
+            paused_session_id, tenant_id=tenant_id
+        ):
+            raise HTTPException(status_code=404, detail="Session not found")
         logger.info(
             "PTC continuation request",
             request_id=request_id,
@@ -93,8 +109,17 @@ async def execute_programmatic(
 
     # Get or create session
     session_id = request.session_id
+    if session_id and not await session_service.validate_session_access(
+        session_id, tenant_id=tenant_id
+    ):
+        raise HTTPException(status_code=404, detail="Session not found")
+    for file_ref in request.files:
+        if not await session_service.validate_session_access(
+            file_ref.session_id, tenant_id=tenant_id
+        ):
+            raise HTTPException(status_code=404, detail="File not found")
     if not session_id:
-        metadata = {}
+        metadata = {"tenant_id": tenant_id}
         if request.entity_id:
             metadata["entity_id"] = request.entity_id
         if request.user_id:
@@ -119,6 +144,7 @@ async def execute_programmatic(
         timeout=_timeout_ms_to_seconds(request.timeout),
         files=request.files,
         lang=request.lang,
+        tenant_id=tenant_id,
     )
 
     # Ensure session_id is set in response

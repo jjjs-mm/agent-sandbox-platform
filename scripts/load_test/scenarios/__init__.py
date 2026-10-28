@@ -9,6 +9,7 @@ from .cpu_bound import (
     CPUMediumScenario,
     CPUHeavyScenario,
     CPUSklearnScenario,
+    QuotaHoldScenario,
 )
 from .memory_bound import (
     Memory10MBScenario,
@@ -49,6 +50,7 @@ SCENARIOS = {
         IOCSVScenario(),
     ],
     "language": get_all_language_scenarios(),
+    "control": [QuotaHoldScenario()],
 }
 
 

@@ -80,6 +80,14 @@ Business logic is organized into focused services:
 | **HealthService**         | `health.py`         | Health checks                                               |
 | **MetricsService**        | `metrics.py`        | Metrics collection                                          |
 | **CleanupService**        | `cleanup.py`        | Background cleanup tasks                                    |
+| **TenantQuotaService**    | `tenant_quota.py`   | Redis-atomic aggregate execution quotas per tenant          |
+
+`TenantQuotaService` keeps usage counters, active leases, and optional tenant
+overrides in keys sharing one Redis Cluster hash tag. The admission Lua script
+reads the tenant override and checks the counters in the same atomic operation,
+so an API replica cannot admit work using a stale read-then-write decision.
+When no override exists, environment-level limits are used. Updating an
+override affects future admissions and does not interrupt active sandboxes.
 
 ### 3. Sandbox Management (`src/services/sandbox/`)
 
@@ -139,24 +147,31 @@ await event_bus.publish(ExecutionCompleted(session_id=..., execution_id=...))
 1. Client POST /exec
        │
        ▼
-2. AuthMiddleware validates API key
+2. AuthMiddleware validates API key and attaches tenant_id
        │
        ▼
-3. ExecutionOrchestrator.execute()
+3. TenantQuotaService atomically reserves tenant capacity
        │
-       ├── 3a. Validate request (language, code size)
+       ├── Remove expired concurrency leases
+       ├── Enforce aggregate concurrent and daily-call limits
+       └── Reject exhausted tenants with HTTP 429
        │
-       ├── 3b. Get/create session (SessionService)
+       ▼
+4. ExecutionOrchestrator.execute()
        │
-       ├── 3c. Load state if session_id provided (StateService)
+       ├── 4a. Validate request (language, code size)
        │
-       ├── 3d. Upload input files to sandbox directory
+       ├── 4b. Validate tenant ownership and get/create session (SessionService)
        │
-       ├── 3e. Acquire sandbox from pool
+       ├── 4c. Load state if session_id provided (StateService)
+       │
+       ├── 4d. Upload input files to sandbox directory
+       │
+       ├── 4e. Acquire sandbox from pool
        │         │
        │         └── SandboxPool.acquire() → returns warm sandbox
        │
-       ├── 3f. Execute code
+       ├── 4f. Execute code
        │         │
        │         ├── Python + REPL: REPLExecutor.execute()
        │         │     └── Send JSON via stdin/stdout pipe
@@ -164,14 +179,17 @@ await event_bus.publish(ExecutionCompleted(session_id=..., execution_id=...))
        │         └── Other languages: SandboxExecutor.execute()
        │               └── nsjail subprocess with timeout
        │
-       ├── 3g. Save state if Python (StateService)
+       ├── 4g. Save state if Python (StateService)
        │
-       ├── 3h. Collect output files from sandbox directory
+       ├── 4h. Collect output files from sandbox directory
        │
-       └── 3i. Destroy sandbox immediately
+       └── 4i. Destroy sandbox immediately
        │
        ▼
-4. Return ExecResponse with stdout, stderr, files, session_id
+5. Release quota lease in finally and charge measured execution time
+       │
+       ▼
+6. Return ExecResponse with stdout, stderr, files, session_id
 ```
 
 ### File Upload Flow
@@ -180,20 +198,54 @@ await event_bus.publish(ExecutionCompleted(session_id=..., execution_id=...))
 1. Client POST /upload (multipart/form-data)
        │
        ▼
-2. AuthMiddleware validates API key
+2. AuthMiddleware validates API key and attaches tenant_id
        │
        ▼
-3. FileService.upload()
+3. File API creates a tenant-owned session
        │
        ├── 3a. Validate file size and count
        │
-       ├── 3b. Get/create session
+       ├── 3b. Store tenant_id in session metadata
        │
        └── 3c. Store file in S3 (Garage by default)
        │
        ▼
 4. Return session_id and file_id
 ```
+
+### Tenant Isolation Boundary
+
+Managed API keys carry a `tenant_id`. `SecurityMiddleware` places that value
+in request state, and every newly created execution or upload session persists
+it in Redis metadata. Before the application lists, downloads, inspects, links,
+or mounts a file, `SessionService.validate_session_access()` verifies that the
+source session belongs to the authenticated tenant.
+
+Foreign sessions are intentionally indistinguishable from missing sessions on
+read endpoints: file lists return an empty list and object/download endpoints
+return `404`. Execution attempts using a foreign session or file reference are
+rejected before S3 lookup or sandbox acquisition. Programmatic execution and
+continuation tokens apply the same session boundary.
+
+`TenantQuotaService` adds resource isolation above this data boundary. API-key
+rate limits remain credential-specific; tenant quotas aggregate every managed
+key with the same `tenant_id`. A Redis Lua script performs cleanup, limit
+checks, daily-call accounting, and lease creation atomically, preventing
+multiple API workers from over-admitting the final slot. Leases carry an
+expiry score so crashed workers do not leak concurrency capacity indefinitely.
+Operators can inspect the same Redis counters through
+`GET /api/v1/admin/tenants/{tenant_id}/quota`; the endpoint requires the master
+API key and reports active executions, UTC-day usage, limits, and reset time.
+
+Programmatic Tool Calling transfers the quota lease into `PausedContext` when
+code returns `tool_call_required`. The same lease follows subsequent
+continuation tokens and remains active while the sandbox waits for tool
+results. Terminal completion, errors, execution deadlines, pause expiry, and
+service shutdown all converge on cleanup that releases the lease exactly once.
+
+The live regression test in
+`tests/functional/test_tenant_file_isolation.py` creates two tenant-scoped API
+keys and verifies the complete authentication, storage, and execution path.
 
 ## Sandbox Lifecycle
 
@@ -380,7 +432,8 @@ settings.max_memory_mb
 
 - All endpoints except `/health` require API key
 - API key passed via `x-api-key` header
-- Multiple keys supported via `API_KEYS` env var
+- Managed API keys carry a tenant identity; legacy environment keys use the
+  `default` tenant
 - Key validation cached for performance
 
 ---

@@ -1,11 +1,10 @@
 """Async HTTP client for load testing the Code Interpreter API."""
 
-import asyncio
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-import aiohttp
+import httpx
 
 from .models import ExecutionResult
 
@@ -19,12 +18,14 @@ class LoadTestClient:
         api_key: str,
         timeout_seconds: int = 60,
         max_connections: int = 100,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self.timeout_seconds = timeout_seconds
         self.max_connections = max_connections
-        self._session: Optional[aiohttp.ClientSession] = None
+        self.transport = transport
+        self._session: Optional[httpx.AsyncClient] = None
         self._request_counter = 0
 
     async def __aenter__(self) -> "LoadTestClient":
@@ -37,19 +38,22 @@ class LoadTestClient:
     async def start(self) -> None:
         """Initialize the HTTP session."""
         if self._session is None:
-            connector = aiohttp.TCPConnector(
-                limit=self.max_connections,
-                ssl=False,  # Allow self-signed certs
-            )
-            self._session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=self.timeout,
+            self._session = httpx.AsyncClient(
+                base_url=self.base_url,
+                headers=self._get_headers(),
+                timeout=httpx.Timeout(self.timeout_seconds),
+                limits=httpx.Limits(
+                    max_connections=self.max_connections,
+                    max_keepalive_connections=self.max_connections,
+                ),
+                verify=False,
+                transport=self.transport,
             )
 
     async def close(self) -> None:
         """Close the HTTP session."""
         if self._session:
-            await self._session.close()
+            await self._session.aclose()
             self._session = None
 
     def _get_headers(self) -> Dict[str, str]:
@@ -85,38 +89,29 @@ class LoadTestClient:
 
         start_time = time.perf_counter()
         try:
-            async with self._session.post(
-                f"{self.base_url}/exec",
-                json=payload,
-                headers=self._get_headers(),
-                ssl=False,
-            ) as response:
-                latency_ms = (time.perf_counter() - start_time) * 1000
-                body = await response.json()
+            response = await self._session.post("/exec", json=payload)
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            body = response.json()
 
-                success = response.status == 200
-                error = None
-                if not success:
-                    error = body.get("detail", f"HTTP {response.status}")
+            success = response.status_code == 200
+            error = None
+            if not success:
+                raw_error = body.get("detail", body.get("error", ""))
+                error = str(raw_error or f"HTTP {response.status_code}")
 
-                # Extract container source if available
-                container_source = None
-                if "container_source" in body:
-                    container_source = body["container_source"]
+            return ExecutionResult(
+                success=success,
+                latency_ms=latency_ms,
+                status_code=response.status_code,
+                language=language,
+                scenario_id=scenario_id,
+                error=error,
+                files_generated=len(body.get("files", [])),
+                timestamp=datetime.now(timezone.utc),
+                container_source=body.get("container_source"),
+            )
 
-                return ExecutionResult(
-                    success=success,
-                    latency_ms=latency_ms,
-                    status_code=response.status,
-                    language=language,
-                    scenario_id=scenario_id,
-                    error=error,
-                    files_generated=len(body.get("files", [])),
-                    timestamp=datetime.now(timezone.utc),
-                    container_source=container_source,
-                )
-
-        except asyncio.TimeoutError:
+        except httpx.TimeoutException:
             latency_ms = (time.perf_counter() - start_time) * 1000
             return ExecutionResult(
                 success=False,
@@ -127,7 +122,7 @@ class LoadTestClient:
                 error="Request timed out",
                 timestamp=datetime.now(timezone.utc),
             )
-        except aiohttp.ClientError as e:
+        except httpx.RequestError as e:
             latency_ms = (time.perf_counter() - start_time) * 1000
             return ExecutionResult(
                 success=False,
@@ -156,13 +151,10 @@ class LoadTestClient:
             await self.start()
 
         try:
-            async with self._session.get(
-                f"{self.base_url}/health",
-                ssl=False,
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                return {"status": "unhealthy", "code": response.status}
+            response = await self._session.get("/health")
+            if response.status_code == 200:
+                return response.json()
+            return {"status": "unhealthy", "code": response.status_code}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -172,14 +164,10 @@ class LoadTestClient:
             await self.start()
 
         try:
-            async with self._session.get(
-                f"{self.base_url}/health/detailed",
-                headers=self._get_headers(),
-                ssl=False,
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                return {"status": "unhealthy", "code": response.status}
+            response = await self._session.get("/health/detailed")
+            if response.status_code == 200:
+                return response.json()
+            return {"status": "unhealthy", "code": response.status_code}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -189,14 +177,10 @@ class LoadTestClient:
             await self.start()
 
         try:
-            async with self._session.get(
-                f"{self.base_url}/metrics",
-                headers=self._get_headers(),
-                ssl=False,
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                return {"error": f"HTTP {response.status}"}
+            response = await self._session.get("/metrics")
+            if response.status_code == 200:
+                return response.json()
+            return {"error": f"HTTP {response.status_code}"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -206,14 +190,10 @@ class LoadTestClient:
             await self.start()
 
         try:
-            async with self._session.get(
-                f"{self.base_url}/metrics/pool",
-                headers=self._get_headers(),
-                ssl=False,
-            ) as response:
-                if response.status == 200:
-                    return await response.json()
-                return {"error": f"HTTP {response.status}"}
+            response = await self._session.get("/metrics/pool")
+            if response.status_code == 200:
+                return response.json()
+            return {"error": f"HTTP {response.status_code}"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -226,3 +206,39 @@ class LoadTestClient:
             if result.success:
                 successful += 1
         return successful
+
+    async def probe_health(self) -> ExecutionResult:
+        """Measure one lightweight control-plane request."""
+        if self._session is None:
+            await self.start()
+
+        started_at = time.perf_counter()
+        try:
+            response = await self._session.get("/health")
+            latency_ms = (time.perf_counter() - started_at) * 1000
+            return ExecutionResult(
+                success=response.status_code == 200,
+                latency_ms=latency_ms,
+                status_code=response.status_code,
+                language="http",
+                scenario_id="health_baseline",
+                error=None if response.status_code == 200 else response.text[:200],
+            )
+        except httpx.TimeoutException:
+            return ExecutionResult(
+                success=False,
+                latency_ms=(time.perf_counter() - started_at) * 1000,
+                status_code=0,
+                language="http",
+                scenario_id="health_baseline",
+                error="Request timed out",
+            )
+        except httpx.RequestError as exc:
+            return ExecutionResult(
+                success=False,
+                latency_ms=(time.perf_counter() - started_at) * 1000,
+                status_code=0,
+                language="http",
+                scenario_id="health_baseline",
+                error=str(exc),
+            )

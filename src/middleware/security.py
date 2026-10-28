@@ -189,6 +189,7 @@ class SecurityMiddleware:
         scope["state"]["api_key"] = ""
         scope["state"]["api_key_hash"] = "anonymous"
         scope["state"]["is_env_key"] = False
+        scope["state"]["tenant_id"] = "default"
 
     async def _authenticate_request(self, request: Request, scope: dict):
         """Handle API key authentication with rate limiting."""
@@ -218,6 +219,7 @@ class SecurityMiddleware:
                 scope["state"]["api_key"] = api_key
                 scope["state"]["api_key_hash"] = "master"
                 scope["state"]["is_env_key"] = True
+                scope["state"]["tenant_id"] = "default"
                 return
 
         # Validate API key with full details
@@ -264,6 +266,11 @@ class SecurityMiddleware:
         scope["state"]["api_key"] = api_key
         scope["state"]["api_key_hash"] = result.key_hash
         scope["state"]["is_env_key"] = result.is_env_key
+        scope["state"]["tenant_id"] = (
+            result.key_record.tenant_id
+            if result.key_record is not None
+            else "default"
+        )
 
         # Record usage for all keys (both managed and env keys)
         if result.key_hash:

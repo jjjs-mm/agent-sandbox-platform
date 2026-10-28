@@ -12,10 +12,12 @@ The pool continuously replenishes to maintain warm sandboxes.
 import asyncio
 import os
 import signal
+import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Optional, Set
+from typing import Deque, Dict, Optional, Set
 
 import structlog
 
@@ -99,6 +101,14 @@ class SandboxPool:
         # Event for exhaustion-triggered replenishment
         self._replenish_event = asyncio.Event()
 
+        # Runtime load used by adaptive replenishment. Acquired sandboxes are
+        # single-use and remain in this set until the orchestrator destroys
+        # them after returning the response.
+        self._in_use: Set[str] = set()
+        self._pending_acquisitions = 0
+        self._recent_misses: Dict[str, Deque[float]] = {}
+        self._replenishment_deferred = False
+
     async def start(self) -> None:
         """Start the sandbox pool and warmup background task."""
         if self._running:
@@ -127,6 +137,9 @@ class SandboxPool:
             parallel_batch=settings.sandbox_pool_parallel_batch,
             replenish_interval=settings.sandbox_pool_replenish_interval,
             exhaustion_trigger=settings.sandbox_pool_exhaustion_trigger,
+            adaptive_enabled=settings.sandbox_pool_adaptive_enabled,
+            adaptive_max_size=settings.sandbox_pool_adaptive_max_size,
+            replenish_max_active=settings.sandbox_pool_replenish_max_active,
         )
 
     async def stop(self) -> None:
@@ -214,6 +227,7 @@ class SandboxPool:
 
                         # Update sandbox session info
                         pooled.sandbox_info.session_id = session_id
+                        pooled.sandbox_info.labels["pool_source"] = "pool_hit"
 
                         await event_bus.publish(
                             ContainerAcquiredFromPool(
@@ -226,6 +240,7 @@ class SandboxPool:
                         self._record_stats(
                             language, pool_hit=True, acquire_time_ms=acquire_time
                         )
+                        self._in_use.add(pooled.sandbox_info.sandbox_id)
                         logger.debug(
                             "Acquired sandbox from pool",
                             session_id=session_id[:12] if session_id else "none",
@@ -246,7 +261,13 @@ class SandboxPool:
             )
 
         # Create fresh sandbox (fallback)
-        sandbox_info = await self._create_fresh_sandbox(session_id, language)
+        self._pending_acquisitions += 1
+        try:
+            sandbox_info = await self._create_fresh_sandbox(session_id, language)
+        finally:
+            self._pending_acquisitions -= 1
+        sandbox_info.labels["pool_source"] = "pool_miss"
+        self._record_recent_miss(language)
         reason = "pool_empty" if settings.sandbox_pool_enabled else "pool_disabled"
         await event_bus.publish(
             ContainerCreatedFresh(
@@ -257,6 +278,7 @@ class SandboxPool:
             )
         )
         self._record_stats(language, pool_miss=True)
+        self._in_use.add(sandbox_info.sandbox_id)
 
         return sandbox_info
 
@@ -267,6 +289,7 @@ class SandboxPool:
         then removes the sandbox directory.
         """
         if sandbox_info:
+            self._in_use.discard(sandbox_info.sandbox_id)
             # Kill REPL process tree if tracked
             repl_process = self._repl_processes.pop(sandbox_info.sandbox_id, None)
             if repl_process and repl_process.process.returncode is None:
@@ -320,6 +343,47 @@ class SandboxPool:
             else:
                 stats[lang] = PoolStats(language=lang, available_count=available)
         return stats
+
+    def get_runtime_state(self) -> Dict[str, object]:
+        """Return adaptive-pool state for health checks and diagnostics."""
+        languages = self._warmup_languages or set(self._available.keys())
+        return {
+            "adaptive_enabled": settings.sandbox_pool_adaptive_enabled,
+            "in_use": len(self._in_use),
+            "pending_acquisitions": self._pending_acquisitions,
+            "replenishment_deferred": self._replenishment_deferred,
+            "target_sizes": {
+                language: self._target_size(language) for language in languages
+            },
+        }
+
+    def _record_recent_miss(self, language: str) -> None:
+        misses = self._recent_misses.setdefault(language, deque())
+        misses.append(time.monotonic())
+        self._prune_recent_misses(language)
+
+    def _prune_recent_misses(self, language: str) -> None:
+        misses = self._recent_misses.setdefault(language, deque())
+        cutoff = time.monotonic() - settings.sandbox_pool_adaptive_miss_window_seconds
+        while misses and misses[0] < cutoff:
+            misses.popleft()
+
+    def _target_size(self, language: str) -> int:
+        base_size = PoolConfig.from_settings(language).size
+        if not settings.sandbox_pool_adaptive_enabled:
+            return base_size
+
+        self._prune_recent_misses(language)
+        recent_misses = len(self._recent_misses.get(language, ()))
+        maximum = max(base_size, settings.sandbox_pool_adaptive_max_size)
+        return min(maximum, base_size + recent_misses)
+
+    def _should_defer_replenishment(self) -> bool:
+        return (
+            settings.sandbox_pool_adaptive_enabled
+            and len(self._in_use) + self._pending_acquisitions
+            > settings.sandbox_pool_replenish_max_active
+        )
 
     # =========================================================================
     # Private methods
@@ -488,6 +552,18 @@ class SandboxPool:
 
         while self._running:
             try:
+                if self._should_defer_replenishment():
+                    self._replenishment_deferred = True
+                    self._replenish_event.clear()
+                    logger.debug(
+                        "Deferring sandbox replenishment under execution load",
+                        in_use=len(self._in_use),
+                        max_active=settings.sandbox_pool_replenish_max_active,
+                    )
+                    await asyncio.sleep(replenish_interval)
+                    continue
+
+                self._replenishment_deferred = False
                 for language in self._warmup_languages:
                     await self._warmup_language(language)
 
@@ -523,14 +599,18 @@ class SandboxPool:
 
     async def _warmup_language(self, language: str) -> None:
         """Warm up sandboxes for a specific language using parallel creation."""
-        config = PoolConfig.from_settings(language)
         queue = self._available.setdefault(language, asyncio.Queue())
+        target_size = self._target_size(language)
+        await self._prune_unhealthy_sandboxes(queue)
 
         current_size = queue.qsize()
-        if current_size >= config.size:
+        if current_size > target_size:
+            await self._shrink_queue(queue, current_size - target_size)
+            return
+        if current_size == target_size:
             return
 
-        needed = config.size - current_size
+        needed = target_size - current_size
         created = 0
 
         # Enable REPL mode for Python if configured
@@ -540,6 +620,15 @@ class SandboxPool:
         batch_size = settings.sandbox_pool_parallel_batch
 
         for batch_start in range(0, needed, batch_size):
+            if self._should_defer_replenishment():
+                self._replenishment_deferred = True
+                logger.debug(
+                    "Pausing sandbox replenishment between batches",
+                    in_use=len(self._in_use),
+                    pending_acquisitions=self._pending_acquisitions,
+                )
+                break
+
             batch_end = min(batch_start + batch_size, needed)
             batch_count = batch_end - batch_start
 
@@ -571,8 +660,40 @@ class SandboxPool:
                 language=language,
                 created=created,
                 total=queue.qsize(),
+                target=target_size,
                 repl_mode=use_repl_mode,
             )
+
+    async def _prune_unhealthy_sandboxes(
+        self, queue: asyncio.Queue[PooledSandbox]
+    ) -> None:
+        """Remove dead REPLs without disturbing healthy queue order."""
+        candidates = queue.qsize()
+        for _ in range(candidates):
+            try:
+                pooled = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            process_alive = not pooled.repl_enabled or (
+                pooled.repl_process is not None
+                and pooled.repl_process.process.returncode is None
+            )
+            if process_alive:
+                await queue.put(pooled)
+            else:
+                await self._destroy_pooled_sandbox(pooled)
+
+    async def _shrink_queue(
+        self, queue: asyncio.Queue[PooledSandbox], count: int
+    ) -> None:
+        """Destroy idle capacity above the current adaptive target."""
+        for _ in range(count):
+            try:
+                pooled = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            await self._destroy_pooled_sandbox(pooled)
 
     async def _create_pooled_sandbox(
         self, language: str, use_repl_mode: bool

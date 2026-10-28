@@ -45,18 +45,28 @@ class ReportGenerator:
 
         # System metrics
         metrics = report.overall_system_metrics
-        self._print_header("SYSTEM METRICS")
-        print(f"  CPU Usage:          avg {metrics.cpu_percent_avg:.1f}%, max {metrics.cpu_percent_max:.1f}%")
-        print(f"  Memory Usage:       avg {metrics.memory_percent_avg:.1f}%, max {metrics.memory_percent_max:.1f}%")
+        self._print_header("LOAD GENERATOR SYSTEM METRICS")
+        print(
+            f"  CPU Usage:          avg {metrics.cpu_percent_avg:.1f}%, max {metrics.cpu_percent_max:.1f}%"
+        )
+        print(
+            f"  Memory Usage:       avg {metrics.memory_percent_avg:.1f}%, max {metrics.memory_percent_max:.1f}%"
+        )
         print(f"  Memory Used:        {metrics.memory_mb_used:.0f} MB")
-        print(f"  Disk I/O:           read {metrics.disk_read_mb:.1f} MB, write {metrics.disk_write_mb:.1f} MB")
-        print(f"  Network I/O:        sent {metrics.network_sent_mb:.1f} MB, recv {metrics.network_recv_mb:.1f} MB")
+        print(
+            f"  Disk I/O:           read {metrics.disk_read_mb:.1f} MB, write {metrics.disk_write_mb:.1f} MB"
+        )
+        print(
+            f"  Network I/O:        sent {metrics.network_sent_mb:.1f} MB, recv {metrics.network_recv_mb:.1f} MB"
+        )
         print()
 
         # Scenario results
         self._print_header("SCENARIO RESULTS")
         print()
-        print(f"  {'Scenario':<30} {'Best RPS':<12} {'Best Conc':<12} {'P99 (ms)':<12} {'Success':<10}")
+        print(
+            f"  {'Scenario':<30} {'Best RPS':<12} {'Best Conc':<12} {'P99 (ms)':<12} {'Success':<10}"
+        )
         print(f"  {'-' * 76}")
 
         for scenario in report.scenarios:
@@ -73,13 +83,39 @@ class ReportGenerator:
 
             if scenario.breaking_point:
                 bp = scenario.breaking_point
-                print(f"    -> Breaking point at concurrency {bp.concurrency}: {bp.reason}")
+                print(
+                    f"    -> Breaking point at concurrency {bp.concurrency}: {bp.reason}"
+                )
+            if best_result.quota_rejections:
+                print(
+                    f"    -> Tenant quota rejections (HTTP 429): {best_result.quota_rejections}"
+                )
+            if best_result.pool_hits or best_result.pool_misses:
+                print(
+                    "    -> Pool: "
+                    f"{best_result.pool_hits} hits, "
+                    f"{best_result.pool_misses} misses, "
+                    f"{best_result.pool_hit_rate:.1f}% hit rate"
+                )
+            if best_result.container_sources:
+                sources = ", ".join(
+                    f"{name}={count}"
+                    for name, count in sorted(best_result.container_sources.items())
+                )
+                print(f"    -> Response sources: {sources}")
 
         print()
 
         # VM Recommendations
         rec = report.vm_recommendations
         self._print_header("VM SIZING RECOMMENDATIONS")
+        if rec.bottleneck == "not_applicable":
+            print("  Skipped: server-side resource metrics were not collected.")
+            for note in rec.notes:
+                print(f"  - {note}")
+            print()
+            self._print_footer()
+            return
         print()
         print(f"  Estimated Resources:")
         print(f"    CPU Cores:        {rec.cpu_cores}")
@@ -113,7 +149,9 @@ class ReportGenerator:
         print(f"  Language:  {scenario.language}")
         print()
 
-        print(f"  {'Concurrency':<12} {'Requests':<10} {'Success':<10} {'RPS':<10} {'P50':<10} {'P95':<10} {'P99':<10}")
+        print(
+            f"  {'Concurrency':<12} {'Requests':<10} {'Success':<10} {'RPS':<10} {'P50':<10} {'P95':<10} {'P99':<10}"
+        )
         print(f"  {'-' * 72}")
 
         for result in scenario.results:

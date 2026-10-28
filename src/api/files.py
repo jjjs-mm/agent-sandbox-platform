@@ -32,6 +32,17 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
+async def _require_tenant_session(
+    request: Request, session_service: SessionServiceDep, session_id: str
+) -> None:
+    """Fail closed when a file's source session belongs to another tenant."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    if not await session_service.validate_session_access(
+        session_id, tenant_id=tenant_id
+    ):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+
 _ASCII_FILENAME_CHARS = (
     "-_.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 )
@@ -61,6 +72,7 @@ def _build_content_disposition(
 
 @router.post("/upload")
 async def upload_file(
+    request: Request,
     file: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = File(None),
     entity_id: Optional[str] = Form(None),
@@ -118,7 +130,7 @@ async def upload_file(
 
         # Create a real session for file uploads
         # This enables session reuse when files are referenced in /exec
-        metadata = {}
+        metadata = {"tenant_id": getattr(request.state, "tenant_id", "default")}
         if entity_id:
             metadata["entity_id"] = entity_id
         session = await session_service.create_session(SessionCreate(metadata=metadata))
@@ -262,7 +274,9 @@ async def upload_files_batch(
         "yes",
     )
 
-    metadata = {"entity_id": entity_id} if entity_id else {}
+    metadata = {"tenant_id": getattr(request.state, "tenant_id", "default")}
+    if entity_id:
+        metadata["entity_id"] = entity_id
     session = await session_service.create_session(SessionCreate(metadata=metadata))
     session_id = session.session_id
 
@@ -354,6 +368,7 @@ async def upload_files_batch(
 @router.get("/files/{session_id}")
 async def list_files(
     session_id: str,
+    request: Request,
     detail: Optional[str] = Query(
         None,
         description="Detail level: 'simple' for basic info, otherwise full details",
@@ -371,9 +386,17 @@ async def list_files(
         description="Resource version (only meaningful when kind=skill)",
     ),
     file_service: FileServiceDep = None,
+    session_service: SessionServiceDep = None,
 ):
     """List all files in a session with optional detail parameter - LibreChat compatible."""
     try:
+        # Preserve the existing empty-list contract for missing sessions while
+        # making foreign sessions indistinguishable from missing ones.
+        if not await session_service.validate_session_access(
+            session_id,
+            tenant_id=getattr(request.state, "tenant_id", "default"),
+        ):
+            return []
         files = await file_service.list_files(session_id)
 
         if not files:
@@ -441,6 +464,8 @@ async def list_files(
                 )
             return detailed_files
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Failed to list files", session_id=session_id, error=str(e))
         # Return 404 if session not found
@@ -451,7 +476,9 @@ async def list_files(
 async def get_session_object_metadata(
     session_id: str,
     file_id: str,
+    request: Request,
     file_service: FileServiceDep = None,
+    session_service: SessionServiceDep = None,
 ):
     """Session-liveness probe used by LibreChat's `primeFiles()`.
 
@@ -461,6 +488,7 @@ async def get_session_object_metadata(
     file's `created_at`, normalized to UTC + `Z`, matching the format used
     by `GET /files/{session_id}?detail=summary`.
     """
+    await _require_tenant_session(request, session_service, session_id)
     try:
         file_info = await file_service.get_file_info(session_id, file_id)
     except Exception as e:
@@ -490,9 +518,14 @@ async def get_session_object_metadata(
 
 @router.get("/download/{session_id}/{file_id}")
 async def download_file(
-    session_id: str, file_id: str, file_service: FileServiceDep = None
+    session_id: str,
+    file_id: str,
+    request: Request,
+    file_service: FileServiceDep = None,
+    session_service: SessionServiceDep = None,
 ):
     """Download a file directly - LibreChat compatible."""
+    await _require_tenant_session(request, session_service, session_id)
     try:
         # Get file info first
         file_info = await file_service.get_file_info(session_id, file_id)

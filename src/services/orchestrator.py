@@ -35,7 +35,7 @@ from ..models import (
     ValidationError,
     ServiceUnavailableError,
 )
-from ..models.errors import ErrorDetail
+from ..models.errors import CodeInterpreterException, ErrorDetail, ErrorType
 from .interfaces import (
     SessionServiceInterface,
     ExecutionServiceInterface,
@@ -75,6 +75,7 @@ class ExecutionContext:
     state_errors: Optional[List[str]] = None
     # Metrics tracking fields
     api_key_hash: Optional[str] = None
+    tenant_id: str = "default"
     is_env_key: bool = False
     container_source: str = "pool_hit"  # pool_hit, pool_miss, pool_disabled
     execution_start_time: Optional[datetime] = None
@@ -113,6 +114,7 @@ class ExecutionOrchestrator:
         request_id: str = "",
         api_key_hash: Optional[str] = None,
         is_env_key: bool = False,
+        tenant_id: str = "default",
     ) -> ExecResponse:
         """Execute code and return LibreChat-compatible response.
 
@@ -129,6 +131,7 @@ class ExecutionOrchestrator:
             request=request,
             request_id=request_id,
             api_key_hash=api_key_hash,
+            tenant_id=tenant_id,
             is_env_key=is_env_key,
             execution_start_time=datetime.now(),
         )
@@ -170,10 +173,7 @@ class ExecutionOrchestrator:
 
             return response
 
-        except (
-            ValidationError,
-            ServiceUnavailableError,
-        ):
+        except CodeInterpreterException:
             raise
         except ValueError as e:
             logger.error("Invalid execution request", error=str(e))
@@ -240,11 +240,21 @@ class ExecutionOrchestrator:
             try:
                 existing = await self.session_service.get_session(request.session_id)
                 if existing and existing.status.value == "active":
+                    if not await self.session_service.validate_session_access(
+                        request.session_id, tenant_id=ctx.tenant_id
+                    ):
+                        raise CodeInterpreterException(
+                            message="Session access denied",
+                            error_type=ErrorType.AUTHORIZATION,
+                            status_code=403,
+                        )
                     logger.debug(
                         "Reusing session from request",
                         session_id=request.session_id[:12],
                     )
                     return request.session_id
+            except CodeInterpreterException:
+                raise
             except Exception as e:
                 logger.warning(
                     "Error looking up session from request",
@@ -270,7 +280,13 @@ class ExecutionOrchestrator:
                                 if existing.metadata
                                 else None
                             )
-                            if session_user and session_user == request.user_id:
+                            if (
+                                session_user
+                                and session_user == request.user_id
+                                and await self.session_service.validate_session_access(
+                                    file_ref.session_id, tenant_id=ctx.tenant_id
+                                )
+                            ):
                                 logger.debug(
                                     "Reusing session from file reference (same user)",
                                     session_id=file_ref.session_id[:12],
@@ -295,7 +311,12 @@ class ExecutionOrchestrator:
                 )
                 if entity_sessions:
                     existing = entity_sessions[0]
-                    if existing.status.value == "active":
+                    if (
+                        existing.status.value == "active"
+                        and await self.session_service.validate_session_access(
+                            existing.session_id, tenant_id=ctx.tenant_id
+                        )
+                    ):
                         logger.debug(
                             "Reusing session by entity_id",
                             session_id=existing.session_id[:12],
@@ -310,7 +331,7 @@ class ExecutionOrchestrator:
                 )
 
         # Create new session
-        metadata = {}
+        metadata = {"tenant_id": ctx.tenant_id}
         if request.entity_id:
             metadata["entity_id"] = request.entity_id
         if request.user_id:
@@ -384,6 +405,12 @@ class ExecutionOrchestrator:
         mounted_ids = set()
 
         for file_ref in ctx.request.files:
+            if not await self.session_service.validate_session_access(
+                file_ref.session_id, tenant_id=ctx.tenant_id
+            ):
+                raise CodeInterpreterException(
+                    message="File session access denied", status_code=403
+                )
             # Get file info
             file_info = await self.file_service.get_file_info(
                 file_ref.session_id, file_ref.id
@@ -853,6 +880,7 @@ class ExecutionOrchestrator:
             files=ctx.generated_files or [],
             stdout=ctx.stdout,
             stderr=ctx.stderr,
+            container_source=ctx.container_source,
         )
 
     async def _cleanup(self, ctx: ExecutionContext) -> None:

@@ -193,6 +193,7 @@ Thumbs.db
 /logs/
 /data/
 config/local.py
+benchmark_results/
 *.pid
 *.db
 *.db-journal

@@ -9,6 +9,7 @@ executions like large file operations or cold sandbox starts.
 """
 
 import asyncio
+import math
 
 import structlog
 from fastapi import APIRouter, Request
@@ -29,7 +30,9 @@ from ..dependencies.services import (
     ExecutionServiceDep,
     StateServiceDep,
     StateArchivalServiceDep,
+    TenantQuotaServiceDep,
 )
+from ..config import settings
 from ..utils.id_generator import generate_request_id
 
 logger = structlog.get_logger(__name__)
@@ -53,6 +56,7 @@ async def execute_code(
     execution_service: ExecutionServiceDep,
     state_service: StateServiceDep,
     state_archival_service: StateArchivalServiceDep,
+    tenant_quota_service: TenantQuotaServiceDep,
 ):
     """Execute code with specified language and parameters.
 
@@ -75,7 +79,7 @@ async def execute_code(
     # Get API key info from request state (set by SecurityMiddleware)
     api_key_hash = getattr(http_request.state, "api_key_hash", None)
     is_env_key = getattr(http_request.state, "is_env_key", False)
-
+    tenant_id = getattr(http_request.state, "tenant_id", "default")
     logger.info(
         "Code execution request",
         request_id=request_id,
@@ -95,13 +99,30 @@ async def execute_code(
         state_archival_service=state_archival_service,
     )
 
+    requested_timeout_seconds = min(
+        settings.max_execution_time,
+        (
+            math.ceil(request.timeout / 1000)
+            if request.timeout
+            else settings.max_execution_time
+        ),
+    )
+    quota_lease = await tenant_quota_service.acquire(
+        tenant_id=tenant_id,
+        requested_timeout_seconds=requested_timeout_seconds,
+    )
+
     async def _execute() -> ExecResponse:
-        return await orchestrator.execute(
-            request,
-            request_id,
-            api_key_hash=api_key_hash,
-            is_env_key=is_env_key,
-        )
+        try:
+            return await orchestrator.execute(
+                request,
+                request_id,
+                api_key_hash=api_key_hash,
+                is_env_key=is_env_key,
+                tenant_id=tenant_id,
+            )
+        finally:
+            await tenant_quota_service.release(quota_lease)
 
     execution_task = asyncio.create_task(_execute())
 

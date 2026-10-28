@@ -6,6 +6,7 @@ Tests cover:
 """
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,6 +30,7 @@ from src.services.programmatic import (
     ProgrammaticService,
 )
 from src.services.sandbox.nsjail import SandboxInfo
+from src.services.tenant_quota import TenantQuotaLease
 
 # =============================================================================
 # FIXTURES
@@ -62,12 +64,27 @@ def mock_sandbox_manager(mock_sandbox_info):
 
 
 @pytest.fixture
-def ptc_service(mock_sandbox_manager):
+def tenant_quota_service():
+    lease = TenantQuotaLease(
+        tenant_id="tenant-a",
+        lease_id="lease-a",
+        acquired_at=0,
+        reserved=False,
+    )
+    return MagicMock(
+        acquire=AsyncMock(return_value=lease),
+        release=AsyncMock(),
+    )
+
+
+@pytest.fixture
+def ptc_service(mock_sandbox_manager, tenant_quota_service):
     """Create a ProgrammaticService with mocked sandbox manager."""
     file_service = AsyncMock()
     return ProgrammaticService(
         sandbox_manager=mock_sandbox_manager,
         file_service=file_service,
+        tenant_quota_service=tenant_quota_service,
     )
 
 
@@ -384,6 +401,7 @@ class TestProgrammaticServiceStartExecution:
 
         assert response.status == "error"
         assert "PTC server script not found" in response.error
+        ptc_service._tenant_quota_service.release.assert_awaited_once()
 
     async def test_start_execution_creates_sandbox(
         self, ptc_service, mock_sandbox_manager
@@ -409,6 +427,7 @@ class TestProgrammaticServiceStartExecution:
             mock_proc.stdin.drain = AsyncMock()
             mock_proc.returncode = None
             mock_proc.pid = 12345
+            mock_proc.kill = MagicMock()
 
             completed_response = (
                 json.dumps({"type": "completed", "stdout": "hello\n", "stderr": ""})
@@ -426,6 +445,7 @@ class TestProgrammaticServiceStartExecution:
                 code="print('hello')",
                 tools=[],
                 session_id="sess-123",
+                tenant_id="tenant-a",
             )
 
         mock_sandbox_manager.create_sandbox.assert_called_once_with(
@@ -433,6 +453,29 @@ class TestProgrammaticServiceStartExecution:
             language="py",
             repl_mode=False,
         )
+        ptc_service._tenant_quota_service.acquire.assert_awaited_with(
+            tenant_id="tenant-a",
+            requested_timeout_seconds=120,
+        )
+        ptc_service._tenant_quota_service.release.assert_awaited_once()
+
+    async def test_start_execution_releases_lease_if_sandbox_creation_fails(
+        self,
+        ptc_service,
+        mock_sandbox_manager,
+    ):
+        mock_sandbox_manager.create_sandbox.side_effect = RuntimeError("no capacity")
+
+        response = await ptc_service.start_execution(
+            code="print('hello')",
+            tools=[],
+            session_id="sess-123",
+            tenant_id="tenant-a",
+        )
+
+        assert response.status == "error"
+        assert "no capacity" in response.error
+        ptc_service._tenant_quota_service.release.assert_awaited_once()
 
     async def test_start_execution_cleanup_on_exception(
         self, ptc_service, mock_sandbox_manager
@@ -494,6 +537,7 @@ class TestProgrammaticServiceStartExecution:
             mock_proc.stdin.drain = AsyncMock()
             mock_proc.returncode = None
             mock_proc.pid = 12345
+            mock_proc.kill = MagicMock()
             mock_proc.stdout = AsyncMock()
             mock_proc.stdout.read = AsyncMock(
                 return_value=(
@@ -573,6 +617,7 @@ class TestProgrammaticServiceStartExecution:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
         mock_proc.pid = 12345
+        mock_proc.kill = MagicMock()
         mock_proc.stdin = AsyncMock()
         mock_proc.stdin.write = MagicMock()
         mock_proc.stdin.drain = AsyncMock()
@@ -638,6 +683,7 @@ class TestProgrammaticServiceContinueExecution:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
         mock_proc.pid = 12345
+        mock_proc.kill = MagicMock()
 
         ctx = PausedContext(
             sandbox_info=SandboxInfo(
@@ -672,6 +718,7 @@ class TestProgrammaticServiceContinueExecution:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
         mock_proc.pid = 12345
+        mock_proc.kill = MagicMock()
         mock_proc.stdin = AsyncMock()
         mock_proc.stdin.write = MagicMock()
         mock_proc.stdin.drain = AsyncMock()
@@ -723,6 +770,7 @@ class TestProgrammaticServiceReadResponse:
         mock_proc = AsyncMock()
         mock_proc.returncode = 137
         mock_proc.pid = 12345
+        mock_proc.kill = MagicMock()
         mock_proc.stdout = AsyncMock()
         mock_proc.stdout.read = AsyncMock(return_value=b"")
         mock_proc.stderr = AsyncMock()
@@ -750,6 +798,72 @@ class TestProgrammaticServiceReadResponse:
 class TestProgrammaticServiceCleanup:
     """Tests for ProgrammaticService cleanup methods."""
 
+    async def test_paused_execution_keeps_lease_until_completion(
+        self,
+        ptc_service,
+        mock_sandbox_info,
+    ):
+        """A tool-call pause still owns a live sandbox and quota slot."""
+        lease = TenantQuotaLease(
+            tenant_id="tenant-a",
+            lease_id="lease-live",
+            acquired_at=0,
+        )
+        quota_service = ptc_service._tenant_quota_service
+        quota_service.release.reset_mock()
+        mock_proc = AsyncMock()
+        mock_proc.returncode = None
+        mock_proc.pid = 12345
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock()
+        mock_proc.stdin = AsyncMock()
+        mock_proc.stdin.write = MagicMock()
+        mock_proc.stdin.drain = AsyncMock()
+        mock_proc.stdout = AsyncMock()
+        mock_proc.stdout.read = AsyncMock(
+            return_value=(
+                json.dumps(
+                    {
+                        "type": "tool_calls",
+                        "calls": [{"id": "call-1", "name": "search", "input": {}}],
+                    }
+                )
+                + PTC_DELIMITER
+            ).encode()
+        )
+        mock_proc.stderr = AsyncMock()
+        mock_proc.stderr.read = AsyncMock(return_value=b"")
+
+        response = await ptc_service._read_ptc_response(
+            proc=mock_proc,
+            sandbox_info=mock_sandbox_info,
+            session_id="sess-quota",
+            timeout=30,
+            execution_deadline=time.monotonic() + 30,
+            execution_timeout_seconds=30,
+            quota_lease=lease,
+        )
+
+        assert response.status == "tool_call_required"
+        quota_service.release.assert_not_awaited()
+        context = ptc_service._paused_contexts[response.continuation_token]
+        assert context.quota_lease is lease
+
+        mock_proc.stdout.read = AsyncMock(
+            return_value=(
+                json.dumps({"type": "completed", "stdout": "done", "stderr": ""})
+                + PTC_DELIMITER
+            ).encode()
+        )
+        completed = await ptc_service.continue_execution(
+            response.continuation_token,
+            [PTCToolResult(call_id="call-1", result="result")],
+        )
+
+        assert completed.status == "completed"
+        assert not ptc_service._paused_contexts
+        quota_service.release.assert_awaited_once_with(lease)
+
     async def test_cleanup_paused_context(self, ptc_service):
         """Should clean up a specific paused context."""
         token = "cleanup-token"
@@ -757,6 +871,7 @@ class TestProgrammaticServiceCleanup:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
         mock_proc.pid = 12345
+        mock_proc.kill = MagicMock()
         mock_proc.wait = AsyncMock()
 
         mock_timeout = MagicMock()
@@ -774,14 +889,21 @@ class TestProgrammaticServiceCleanup:
             process=mock_proc,
             session_id="sess-3",
             timeout_handle=mock_timeout,
+            quota_lease=TenantQuotaLease(
+                tenant_id="tenant-a",
+                lease_id="lease-cleanup",
+                acquired_at=0,
+            ),
         )
         ptc_service._paused_contexts[token] = ctx
+        ptc_service._tenant_quota_service.release.reset_mock()
 
         await ptc_service._cleanup_paused_context(token)
 
         assert token not in ptc_service._paused_contexts
         mock_timeout.cancel.assert_called_once()
         ptc_service._sandbox_manager.destroy_sandbox.assert_called_once()
+        ptc_service._tenant_quota_service.release.assert_awaited_once()
 
     async def test_cleanup_nonexistent_token(self, ptc_service):
         """Should handle cleanup of nonexistent token gracefully."""
@@ -795,6 +917,7 @@ class TestProgrammaticServiceCleanup:
             mock_proc = AsyncMock()
             mock_proc.returncode = None
             mock_proc.pid = 12345 + i
+            mock_proc.kill = MagicMock()
             mock_proc.wait = AsyncMock()
 
             ctx = PausedContext(

@@ -71,7 +71,9 @@ class VMSizingAnalyzer:
 
             # Check throughput degradation
             if peak_throughput > 0 and result.concurrency > peak_concurrency:
-                degradation = ((peak_throughput - result.throughput_rps) / peak_throughput) * 100
+                degradation = (
+                    (peak_throughput - result.throughput_rps) / peak_throughput
+                ) * 100
                 if degradation > self.throughput_degradation_threshold:
                     return BreakingPoint(
                         concurrency=result.concurrency,
@@ -138,13 +140,18 @@ class VMSizingAnalyzer:
             return 1
 
         target_p99 = target_p99_ms or self.p99_threshold_ms * 0.8  # 80% of threshold
-        target_error = target_error_rate or self.error_rate_threshold * 0.5  # 50% of threshold
+        target_error = (
+            target_error_rate or self.error_rate_threshold * 0.5
+        )  # 50% of threshold
 
         safe_concurrency = 1
 
         for result in results:
             # Check if this concurrency level is safe
-            if result.p99_latency_ms <= target_p99 and result.error_rate <= target_error:
+            if (
+                result.p99_latency_ms <= target_p99
+                and result.error_rate <= target_error
+            ):
                 safe_concurrency = result.concurrency
             else:
                 break
@@ -162,8 +169,7 @@ class VMSizingAnalyzer:
 
         # Find result closest to target concurrency
         closest_result = min(
-            results,
-            key=lambda r: abs(r.concurrency - target_concurrency)
+            results, key=lambda r: abs(r.concurrency - target_concurrency)
         )
 
         metrics = closest_result.system_metrics
@@ -207,6 +213,24 @@ class VMSizingAnalyzer:
         recommendations = VMRecommendations()
         notes = []
 
+        if not report.config.enable_vm_sizing:
+            recommendations.bottleneck = "not_applicable"
+            recommendations.notes = [
+                "VM sizing disabled: client-host metrics do not represent "
+                "the Dockerized API server"
+            ]
+            return recommendations
+
+        if report.scenarios and all(
+            scenario.category == "control" for scenario in report.scenarios
+        ):
+            recommendations.bottleneck = "not_applicable"
+            recommendations.notes = [
+                "Control-plane tests validate HTTP and quota behavior; "
+                "they do not support VM sizing conclusions"
+            ]
+            return recommendations
+
         # Collect all results
         all_results: List[ConcurrencyTestResult] = []
         breaking_points: List[BreakingPoint] = []
@@ -227,18 +251,29 @@ class VMSizingAnalyzer:
         if breaking_points:
             earliest_bp = min(breaking_points, key=lambda bp: bp.concurrency)
             recommendations.breaking_point_concurrency = earliest_bp.concurrency
-            notes.append(f"Breaking point at concurrency {earliest_bp.concurrency}: {earliest_bp.reason}")
+            notes.append(
+                f"Breaking point at concurrency {earliest_bp.concurrency}: {earliest_bp.reason}"
+            )
         else:
             # No breaking point found - use max tested
-            recommendations.breaking_point_concurrency = max(r.concurrency for r in all_results)
+            recommendations.breaking_point_concurrency = max(
+                r.concurrency for r in all_results
+            )
             notes.append("No breaking point found within tested range")
 
         # Calculate safe concurrency (80% of breaking point)
         # Sort results by concurrency to ensure ascending order (fixes mixed scenario results)
         sorted_results = sorted(all_results, key=lambda r: r.concurrency)
-        recommendations.max_safe_concurrency = self.calculate_safe_concurrency(sorted_results)
-        if recommendations.max_safe_concurrency < recommendations.breaking_point_concurrency:
-            notes.append(f"Recommended safe concurrency: {recommendations.max_safe_concurrency}")
+        recommendations.max_safe_concurrency = self.calculate_safe_concurrency(
+            sorted_results
+        )
+        if (
+            recommendations.max_safe_concurrency
+            < recommendations.breaking_point_concurrency
+        ):
+            notes.append(
+                f"Recommended safe concurrency: {recommendations.max_safe_concurrency}"
+            )
 
         # Identify bottleneck
         recommendations.bottleneck = self.identify_bottleneck(all_results)
@@ -269,7 +304,9 @@ class VMSizingAnalyzer:
         elif recommendations.bottleneck == "memory":
             notes.append("Consider memory-optimized VMs for better performance")
         elif recommendations.bottleneck == "io":
-            notes.append("Consider VMs with faster storage (SSD/NVMe) for better performance")
+            notes.append(
+                "Consider VMs with faster storage (SSD/NVMe) for better performance"
+            )
 
         recommendations.notes = notes
         return recommendations
@@ -307,8 +344,12 @@ class VMSizingAnalyzer:
             throughputs = [r.throughput_rps for r in results if r.throughput_rps > 0]
             if throughputs:
                 avg_tp = sum(throughputs) / len(throughputs)
-                variance = sum((t - avg_tp) ** 2 for t in throughputs) / len(throughputs)
-                cv = (variance ** 0.5) / avg_tp if avg_tp > 0 else 1  # Coefficient of variation
+                variance = sum((t - avg_tp) ** 2 for t in throughputs) / len(
+                    throughputs
+                )
+                cv = (
+                    (variance**0.5) / avg_tp if avg_tp > 0 else 1
+                )  # Coefficient of variation
                 if cv < 0.2:
                     score += 0.1
 

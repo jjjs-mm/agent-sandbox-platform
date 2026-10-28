@@ -174,6 +174,7 @@ class LoadTestDefaults:
     monitor_interval_seconds: float = 1.0
     enable_sandbox_stats: bool = True
     output_dir: str = "./load_test_results"
+    server_container: str = ""
 
     # Thresholds
     p99_latency_threshold_ms: float = 1000.0

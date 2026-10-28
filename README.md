@@ -133,10 +133,11 @@ The dashboard requires the master API key for authentication.
 - **High Concurrency**: Thread-safe execution supporting 10+ concurrent requests
 - **Secure Execution**: nsjail-based sandboxed environments with namespace isolation, seccomp, and resource limits
 - **Programmatic Tool Calling (PTC)**: Enables AI agents to execute code that invokes external tools mid-execution via `POST /exec/programmatic`, with multi-round continuation support
-- **File Management**: Upload, download, and manage files within execution sessions
+- **Tenant-Isolated Files**: Bind managed API keys, sessions, uploads, downloads, and execution mounts to a tenant boundary
+- **Tenant Execution Quotas**: Redis-atomic concurrency, daily-call, and measured execution-time limits shared across all keys owned by one tenant
 - **Session Management**: Redis-based session handling with automatic cleanup
 - **S3-Compatible Storage**: Garage (S3-compatible) integration for persistent file storage
-- **Authentication**: API key-based authentication for secure access
+- **Authentication**: Managed API keys with tenant identity and per-key rate limits
 - **HTTPS/SSL Support**: Optional in-container SSL/TLS termination
 - **Health Monitoring**: Comprehensive health check endpoints for all dependencies
 - **Metrics Collection**: Execution and API metrics for monitoring and debugging
@@ -165,6 +166,7 @@ The API provides endpoints for code execution, file management, and session stat
 - `POST /exec/programmatic`: Execute code with Programmatic Tool Calling (PTC) support for AI agent workflows.
 - `POST /upload`: Upload files for processing.
 - `GET /download`: Retrieve generated files.
+- `GET /api/v1/admin/tenants/{tenant_id}/quota`: Inspect live aggregate tenant usage and configured limits (master key required).
 
 Interactive documentation is available at `http://localhost:8000/docs` when the server is running.
 
@@ -189,6 +191,46 @@ The service is highly configurable via environment variables.
 
 A full list of configuration options and a production checklist can be found in [CONFIGURATION.md](docs/CONFIGURATION.md).
 
+### Tenant Resource Quotas
+
+Per-key rate limiting does not stop one tenant from creating several keys and
+using their combined allowance. Enable aggregate tenant quotas to protect the
+shared sandbox pool:
+
+```ini
+TENANT_QUOTA_ENABLED=true
+TENANT_MAX_CONCURRENT_EXECUTIONS=4
+TENANT_DAILY_EXECUTION_LIMIT=1000
+TENANT_DAILY_EXECUTION_SECONDS=3600
+```
+
+Quota admission for `POST /exec` and `POST /exec/programmatic` runs as one
+Redis Lua operation. Expired concurrency leases are removed before each
+admission, so an API process crash cannot hold a slot permanently. A PTC
+execution retains the same lease while paused for tool results and releases it
+only on completion, error, timeout, cancellation, or service shutdown. Daily
+execution time is measured as wall-clock time around the complete execution
+lifecycle and resets on the UTC day boundary.
+
+The environment values are defaults. Administrators can give a tenant its own
+limits without restarting the API; the override is stored in Redis and is
+therefore shared by every API replica:
+
+```bash
+curl -X PUT http://localhost:8000/api/v1/admin/tenants/tenant-a/quota \
+  -H "X-API-Key: $MASTER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "max_concurrent_executions": 8,
+    "daily_execution_limit": 5000,
+    "daily_execution_seconds": 14400
+  }'
+```
+
+Use `GET` on the same URL to inspect usage and effective limits. Use `DELETE`
+to remove the override and restore the environment defaults. Limit changes
+apply to new admissions; running executions keep their existing leases.
+
 ## Development & Installation
 
 For detailed instructions on setting up your local environment, running tests, and building custom images, please refer to the [Development Guide](docs/DEVELOPMENT.md).
@@ -200,6 +242,31 @@ pytest tests/unit/
 ```
 
 For comprehensive testing details, see [TESTING.md](docs/TESTING.md).
+
+### Performance Baseline
+
+The load-test CLI supports control-plane baselines, real sandbox execution
+ramps, sustained workloads, and tenant-quota contention scenarios. Reports
+include throughput, p50/p95/p99 latency, HTTP status counts, failure rate, and
+explicit HTTP 429 quota rejections.
+
+```bash
+python -m scripts.load_test --list-scenarios
+python -m scripts.load_test \
+  --env http://127.0.0.1:8000 \
+  --health-baseline --max-concurrency 20 --requests 500
+```
+
+VM-sizing recommendations are disabled by default because metrics collected on
+a separate load-generator machine do not describe server capacity. See the
+[local baseline report](benchmarks/2026-10-27-local-baseline.md) for the current
+methodology and verified results. The follow-up
+[sandbox pool analysis](benchmarks/2026-10-27-stage2-pool-analysis.md) adds
+explicit 2 CPU / 2 GiB limits, container-side resource sampling, repeated
+runs, and per-request pool hit/miss latency. The
+[adaptive pool benchmark](benchmarks/2026-10-28-adaptive-pool.md) shows how
+load-aware replenishment improves throughput and p95/p99 latency by prioritizing
+foreground executions over background warm-up.
 
 ## CI/CD
 

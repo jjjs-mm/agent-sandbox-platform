@@ -458,12 +458,20 @@ class SessionService(SessionServiceInterface):
         return sessions
 
     async def validate_session_access(
-        self, session_id: str, entity_id: Optional[str] = None
+        self,
+        session_id: str,
+        entity_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> bool:
         """Validate if a session can be accessed, optionally checking entity association."""
         session = await self.get_session(session_id)
         if not session:
             return False
+
+        if tenant_id is not None:
+            session_tenant_id = (session.metadata or {}).get("tenant_id")
+            if session_tenant_id != tenant_id:
+                return False
 
         # If entity_id is provided, check if session belongs to that entity
         if entity_id:

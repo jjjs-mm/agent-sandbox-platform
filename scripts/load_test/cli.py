@@ -55,17 +55,20 @@ Examples:
     # Environment options
     env_group = parser.add_argument_group("Environment")
     env_group.add_argument(
-        "--env", "-e",
+        "--env",
+        "-e",
         default="https://localhost",
         help="Environment URL or profile name (dev/staging/prod)",
     )
     env_group.add_argument(
-        "--api-key", "-k",
+        "--api-key",
+        "-k",
         default=os.environ.get("API_KEY", "test-api-key-for-development-only"),
         help="API key (default: $API_KEY or test key)",
     )
     env_group.add_argument(
-        "--output-dir", "-o",
+        "--output-dir",
+        "-o",
         default="./load_test_results",
         help="Output directory for results (default: ./load_test_results)",
     )
@@ -73,19 +76,22 @@ Examples:
     # Scenario selection
     scenario_group = parser.add_argument_group("Scenario Selection")
     scenario_group.add_argument(
-        "--scenario", "-s",
+        "--scenario",
+        "-s",
         action="append",
         dest="scenarios",
         help="Scenario ID to run (can repeat)",
     )
     scenario_group.add_argument(
-        "--category", "-c",
-        choices=["cpu", "memory", "io", "language", "all"],
+        "--category",
+        "-c",
+        choices=["cpu", "memory", "io", "language", "control", "all"],
         default=None,
         help="Category of scenarios to run",
     )
     scenario_group.add_argument(
-        "--language", "-l",
+        "--language",
+        "-l",
         action="append",
         dest="languages",
         choices=SUPPORTED_LANGUAGES,
@@ -122,6 +128,11 @@ Examples:
     # Test type options
     test_group = parser.add_argument_group("Test Type")
     test_group.add_argument(
+        "--health-baseline",
+        action="store_true",
+        help="Benchmark HTTP control-plane overhead without sandbox execution",
+    )
+    test_group.add_argument(
         "--ramp-up",
         action="store_true",
         help="Run ramp-up test (gradually increase concurrency)",
@@ -151,12 +162,14 @@ Examples:
     # Output options
     output_group = parser.add_argument_group("Output")
     output_group.add_argument(
-        "--quiet", "-q",
+        "--quiet",
+        "-q",
         action="store_true",
         help="Minimal output",
     )
     output_group.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Verbose output",
     )
@@ -164,6 +177,19 @@ Examples:
         "--no-report",
         action="store_true",
         help="Skip report generation",
+    )
+    output_group.add_argument(
+        "--vm-sizing",
+        action="store_true",
+        help=(
+            "Infer VM size only when the load generator runs on the API host "
+            "and its resource metrics represent the server"
+        ),
+    )
+    output_group.add_argument(
+        "--server-container",
+        default=None,
+        help="Docker container name to sample for server-side CPU and memory",
     )
 
     # Other
@@ -242,6 +268,7 @@ def select_scenarios(args) -> List:
                 LanguageBaselineScenario,
                 LanguageComputeScenario,
             )
+
             for lang in args.languages:
                 scenarios.append(LanguageBaselineScenario(lang))
                 scenarios.append(LanguageComputeScenario(lang))
@@ -259,9 +286,9 @@ async def run_load_test(args) -> Optional[LoadTestReport]:
     import uuid
 
     base_url = get_base_url(args.env)
-    scenarios = select_scenarios(args)
+    scenarios = [] if args.health_baseline else select_scenarios(args)
 
-    if not scenarios:
+    if not scenarios and not args.health_baseline:
         print("No scenarios selected")
         return None
 
@@ -277,6 +304,8 @@ async def run_load_test(args) -> Optional[LoadTestReport]:
         warmup_requests=args.warmup,
         timeout_seconds=args.timeout,
         output_dir=args.output_dir,
+        enable_vm_sizing=args.vm_sizing,
+        server_container=args.server_container,
     )
 
     # Progress callback
@@ -290,7 +319,25 @@ async def run_load_test(args) -> Optional[LoadTestReport]:
 
     # Run tests
     async with LoadTestRunner(config, progress) as runner:
-        if args.full_suite:
+        if args.health_baseline:
+            start_time = datetime.now(timezone.utc)
+            scenario_results = [
+                await runner.run_health_baseline(
+                    concurrency=args.max_concurrency,
+                    num_requests=args.requests,
+                )
+            ]
+            end_time = datetime.now(timezone.utc)
+            report = LoadTestReport(
+                test_id=f"load-test-{start_time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
+                environment=args.env,
+                start_time=start_time,
+                end_time=end_time,
+                config=config,
+                scenarios=scenario_results,
+                overall_system_metrics=scenario_results[0].results[0].system_metrics,
+            )
+        elif args.full_suite:
             report = await runner.run_full_suite(scenarios)
         elif args.sustained:
             # Run sustained test at max concurrency
@@ -332,6 +379,13 @@ async def run_load_test(args) -> Optional[LoadTestReport]:
             # Default: ramp-up test
             report = await runner.run_full_suite(scenarios)
 
+    if (
+        report.scenarios
+        and report.scenarios[0].results
+        and report.overall_system_metrics.memory_mb_used == 0
+    ):
+        report.overall_system_metrics = report.scenarios[0].results[0].system_metrics
+
     return report
 
 
@@ -355,6 +409,7 @@ def main() -> int:
         print(f"Error: {e}")
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         return 1
 

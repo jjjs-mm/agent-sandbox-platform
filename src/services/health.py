@@ -468,6 +468,7 @@ class HealthCheckService:
                 "hit_rate_percent": round(hit_rate, 2),
                 "languages": language_stats,
             }
+            details.update(self._sandbox_pool.get_runtime_state())
 
             return HealthCheckResult(
                 service="sandbox_pool",

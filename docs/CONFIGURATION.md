@@ -228,6 +228,10 @@ Pre-warmed Python REPL sandboxes reduce execution latency by eliminating interpr
 | `SANDBOX_POOL_PARALLEL_BATCH`      | `5`     | Number of warmup sandboxes started concurrently          |
 | `SANDBOX_POOL_REPLENISH_INTERVAL`  | `2`     | Seconds between pool replenishment checks                |
 | `SANDBOX_POOL_EXHAUSTION_TRIGGER`  | `true`  | Trigger immediate replenishment when pool is exhausted   |
+| `SANDBOX_POOL_ADAPTIVE_ENABLED`    | `false` | Defer replenishment under load and adapt the idle target |
+| `SANDBOX_POOL_ADAPTIVE_MAX_SIZE`   | `8`     | Maximum adaptive Python pool target                      |
+| `SANDBOX_POOL_ADAPTIVE_MISS_WINDOW_SECONDS` | `30` | Recent miss window used to increase the target       |
+| `SANDBOX_POOL_REPLENISH_MAX_ACTIVE` | `1`    | Maximum active/pending executions allowed during refill |
 | `SANDBOX_UID`                      | `1001`  | Shared host UID used by all sandbox languages            |
 
 **Note:** Sandboxes are destroyed immediately after execution. The pool is automatically replenished in the background. Non-Python languages do not use pooling.

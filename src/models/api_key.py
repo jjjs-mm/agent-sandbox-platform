@@ -62,6 +62,7 @@ class ApiKeyRecord:
     key_prefix: str  # First 8 chars for display (e.g., "sk-abc123")
     name: str  # Human-readable name
     created_at: datetime
+    tenant_id: str = "default"
     enabled: bool = True
     rate_limits: RateLimits = field(default_factory=RateLimits)
     metadata: Dict[str, str] = field(default_factory=dict)
@@ -108,6 +109,7 @@ class ApiKeyRecord:
             "last_used_at": self.last_used_at.isoformat() if self.last_used_at else "",
             "usage_count": str(self.usage_count),
             "source": self.source,
+            "tenant_id": self.tenant_id,
         }
 
     @classmethod
@@ -166,6 +168,7 @@ class ApiKeyRecord:
             key_prefix=decoded["key_prefix"],
             name=decoded["name"],
             created_at=created_at,
+            tenant_id=decoded.get("tenant_id", "default"),
             enabled=decoded.get("enabled", "true").lower() == "true",
             rate_limits=rate_limits,
             metadata=metadata,

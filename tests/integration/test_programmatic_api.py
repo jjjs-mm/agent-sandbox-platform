@@ -6,7 +6,7 @@ with a mocked PTC service. They are not end-to-end PTC execution coverage.
 
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.main import app
 from src.models.programmatic import (
@@ -312,6 +312,7 @@ class TestProgrammaticContinuation:
     ):
         """Continuation with tool_results should return response."""
         mock_service = AsyncMock()
+        mock_service.get_paused_session_id = MagicMock(return_value=None)
         mock_service.continue_execution.return_value = mock_ptc_completed_response
         mock_get_service.return_value = mock_service
 
@@ -353,6 +354,7 @@ class TestProgrammaticContinuation:
     ):
         """Continuation with invalid token should return error."""
         mock_service = AsyncMock()
+        mock_service.get_paused_session_id = MagicMock(return_value=None)
         mock_service.continue_execution.return_value = mock_ptc_error_response
         mock_get_service.return_value = mock_service
 

@@ -3,10 +3,12 @@
 import asyncio
 import subprocess
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 try:
     import psutil
+
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
@@ -21,9 +23,11 @@ class ResourceMonitor:
         self,
         sample_interval: float = 1.0,
         enable_sandbox_stats: bool = True,
+        docker_container: Optional[str] = None,
     ):
         self.sample_interval = sample_interval
         self.enable_sandbox_stats = enable_sandbox_stats
+        self.docker_container = docker_container
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._samples: List[SystemMetrics] = []
@@ -68,10 +72,13 @@ class ResourceMonitor:
         """Background loop to sample metrics."""
         while self._running:
             try:
-                metrics = self._get_current_system_metrics()
+                if self.docker_container:
+                    metrics = await self._get_current_docker_metrics()
+                else:
+                    metrics = self._get_current_system_metrics()
                 self._samples.append(metrics)
 
-                if self.enable_sandbox_stats:
+                if self.enable_sandbox_stats and not self.docker_container:
                     sandbox_stats = self._get_sandbox_stats()
                     if sandbox_stats:
                         self._sandbox_samples.append(sandbox_stats)
@@ -82,6 +89,75 @@ class ResourceMonitor:
             except Exception:
                 # Continue sampling even if one sample fails
                 await asyncio.sleep(self.sample_interval)
+
+    @staticmethod
+    def _size_to_mb(value: str) -> float:
+        """Convert Docker human-readable byte values to MiB."""
+        match = re.fullmatch(r"\s*([0-9.]+)\s*([kmgt]?i?b)\s*", value.lower())
+        if not match:
+            return 0.0
+        amount = float(match.group(1))
+        unit = match.group(2)
+        factors = {
+            "b": 1 / (1024 * 1024),
+            "kb": 1000 / (1024 * 1024),
+            "kib": 1 / 1024,
+            "mb": 1_000_000 / (1024 * 1024),
+            "mib": 1,
+            "gb": 1_000_000_000 / (1024 * 1024),
+            "gib": 1024,
+            "tb": 1_000_000_000_000 / (1024 * 1024),
+            "tib": 1024 * 1024,
+        }
+        return amount * factors.get(unit, 0)
+
+    @classmethod
+    def _io_pair_to_mb(cls, value: str) -> tuple[float, float]:
+        parts = value.split("/")
+        if len(parts) != 2:
+            return 0.0, 0.0
+        return cls._size_to_mb(parts[0]), cls._size_to_mb(parts[1])
+
+    async def _get_current_docker_metrics(self) -> SystemMetrics:
+        """Read one server-container resource sample from Docker."""
+
+        def read_stats() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [
+                    "docker",
+                    "stats",
+                    "--no-stream",
+                    "--format",
+                    "{{json .}}",
+                    self.docker_container,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+        completed = await asyncio.to_thread(read_stats)
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return SystemMetrics()
+
+        payload = json.loads(completed.stdout.splitlines()[0])
+        cpu = float(payload.get("CPUPerc", "0").rstrip("%") or 0)
+        memory_percent = float(payload.get("MemPerc", "0").rstrip("%") or 0)
+        memory_usage = payload.get("MemUsage", "0B / 0B").split("/")[0]
+        disk_read, disk_write = self._io_pair_to_mb(payload.get("BlockIO", ""))
+        net_sent, net_received = self._io_pair_to_mb(payload.get("NetIO", ""))
+        return SystemMetrics(
+            cpu_percent_avg=cpu,
+            cpu_percent_max=cpu,
+            memory_percent_avg=memory_percent,
+            memory_percent_max=memory_percent,
+            memory_mb_used=self._size_to_mb(memory_usage),
+            disk_read_mb=disk_read,
+            disk_write_mb=disk_write,
+            network_sent_mb=net_sent,
+            network_recv_mb=net_received,
+        )
 
     def _get_current_system_metrics(self) -> SystemMetrics:
         """Get current system metrics snapshot."""
@@ -97,16 +173,24 @@ class ResourceMonitor:
         if self._initial_disk_io:
             disk_io = psutil.disk_io_counters()
             if disk_io:
-                disk_read_mb = (disk_io.read_bytes - self._initial_disk_io[0]) / (1024 * 1024)
-                disk_write_mb = (disk_io.write_bytes - self._initial_disk_io[1]) / (1024 * 1024)
+                disk_read_mb = (disk_io.read_bytes - self._initial_disk_io[0]) / (
+                    1024 * 1024
+                )
+                disk_write_mb = (disk_io.write_bytes - self._initial_disk_io[1]) / (
+                    1024 * 1024
+                )
 
         net_sent_mb = 0.0
         net_recv_mb = 0.0
         if self._initial_net_io:
             net_io = psutil.net_io_counters()
             if net_io:
-                net_sent_mb = (net_io.bytes_sent - self._initial_net_io[0]) / (1024 * 1024)
-                net_recv_mb = (net_io.bytes_recv - self._initial_net_io[1]) / (1024 * 1024)
+                net_sent_mb = (net_io.bytes_sent - self._initial_net_io[0]) / (
+                    1024 * 1024
+                )
+                net_recv_mb = (net_io.bytes_recv - self._initial_net_io[1]) / (
+                    1024 * 1024
+                )
 
         return SystemMetrics(
             cpu_percent_avg=cpu_percent,
@@ -131,7 +215,9 @@ class ResourceMonitor:
             total_cpu = 0.0
             total_memory_mb = 0.0
 
-            for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
+            for proc in psutil.process_iter(
+                ["pid", "name", "cpu_percent", "memory_info"]
+            ):
                 try:
                     if proc.info["name"] and "nsjail" in proc.info["name"]:
                         cpu = proc.info.get("cpu_percent", 0.0) or 0.0
@@ -141,11 +227,13 @@ class ResourceMonitor:
                         total_cpu += cpu
                         total_memory_mb += mem_mb
 
-                        nsjail_procs.append({
-                            "name": f"nsjail-{proc.info['pid']}",
-                            "cpu_percent": cpu,
-                            "memory_mb": mem_mb,
-                        })
+                        nsjail_procs.append(
+                            {
+                                "name": f"nsjail-{proc.info['pid']}",
+                                "cpu_percent": cpu,
+                                "memory_mb": mem_mb,
+                            }
+                        )
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
 

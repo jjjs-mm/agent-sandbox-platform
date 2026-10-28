@@ -91,6 +91,10 @@ class ExecResponse(BaseModel):
     files: List[FileRef] = Field(default_factory=list)
     stdout: str = ""
     stderr: str = ""
+    container_source: Optional[str] = Field(
+        default=None,
+        description="Execution capacity source: pool_hit or pool_miss",
+    )
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}

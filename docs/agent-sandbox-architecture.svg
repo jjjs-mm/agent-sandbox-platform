@@ -1,0 +1,193 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1220" viewBox="0 0 1600 1220" role="img" aria-labelledby="title desc">
+  <title id="title">Agent Sandbox Control Plane 系统架构</title>
+  <desc id="desc">展示客户端、FastAPI 控制面、租户认证与配额、执行编排、自适应沙箱池、nsjail、Redis、S3 和可观测性的完整关系。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#4f72d8"/>
+    </marker>
+    <style>
+      .title { font: 700 34px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #182033; }
+      .subtitle { font: 400 17px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #657087; }
+      .layer { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #3e5fbe; }
+      .layer-note { font: 400 13px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #7b8496; }
+      .box-title { font: 700 17px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #182033; }
+      .box-sub { font: 400 13px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #59647a; }
+      .tag { font: 500 11px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #4b556a; }
+      .badge { font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #3154b6; }
+      .flow { font: 500 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #4f72d8; }
+      .metric-name { font: 500 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #6a7488; }
+      .metric-value { font: 700 23px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #3154b6; }
+      .foot { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; fill: #7b8496; }
+      .box { fill: #ffffff; stroke: #cdd3df; stroke-width: 1.4; }
+      .mine { fill: #edf2ff; stroke: #4f72d8; stroke-width: 2; }
+      .tag-bg { fill: #f0f2f6; }
+      .badge-bg { fill: #dce6ff; }
+      .metric-bg { fill: #f1f4fa; }
+      .lane { fill: #f8f9fc; stroke: #e1e5ed; stroke-width: 1; }
+      .line { stroke: #4f72d8; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .data-line { stroke: #7d8bad; stroke-width: 1.7; stroke-dasharray: 7 5; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1220" fill="#f5f7fb"/>
+
+  <text x="70" y="62" class="title">Agent Sandbox Control Plane</text>
+  <text x="70" y="92" class="subtitle">面向 Coding Agent 的多租户、不可信代码执行平台</text>
+  <rect x="1240" y="45" width="108" height="28" rx="14" class="badge-bg"/>
+  <text x="1264" y="64" class="badge">你的增强</text>
+  <rect x="1360" y="45" width="108" height="28" rx="14" fill="#eef0f4"/>
+  <text x="1384" y="64" class="tag">上游底座</text>
+
+  <!-- Layer 1 -->
+  <rect x="48" y="126" width="1504" height="174" rx="14" class="lane"/>
+  <text x="70" y="158" class="layer">01  接入与身份层</text>
+  <text x="251" y="158" class="layer-note">建立租户身份与访问边界</text>
+
+  <rect x="90" y="184" width="330" height="88" rx="9" class="box"/>
+  <text x="112" y="213" class="box-title">Agent / API Client</text>
+  <text x="112" y="237" class="box-sub">Mini Agent、LibreChat、HTTP 客户端</text>
+  <rect x="112" y="248" width="72" height="18" rx="4" class="tag-bg"/><text x="121" y="261" class="tag">POST /exec</text>
+  <rect x="190" y="248" width="58" height="18" rx="4" class="tag-bg"/><text x="202" y="261" class="tag">文件</text>
+  <rect x="254" y="248" width="48" height="18" rx="4" class="tag-bg"/><text x="266" y="261" class="tag">PTC</text>
+
+  <path d="M420 228 H518" class="line"/>
+  <text x="451" y="216" class="flow">HTTPS</text>
+
+  <rect x="520" y="184" width="400" height="88" rx="9" class="box"/>
+  <text x="542" y="213" class="box-title">FastAPI Control Plane</text>
+  <text x="542" y="237" class="box-sub">Exec / File / Admin / Health API</text>
+  <rect x="542" y="248" width="84" height="18" rx="4" class="tag-bg"/><text x="552" y="261" class="tag">请求校验</text>
+  <rect x="632" y="248" width="84" height="18" rx="4" class="tag-bg"/><text x="642" y="261" class="tag">统一响应</text>
+  <rect x="722" y="248" width="84" height="18" rx="4" class="tag-bg"/><text x="732" y="261" class="tag">后台管理</text>
+
+  <path d="M920 228 H1018" class="line"/>
+  <text x="949" y="216" class="flow">认证</text>
+
+  <rect x="1020" y="174" width="440" height="108" rx="9" class="mine"/>
+  <rect x="1331" y="186" width="108" height="24" rx="12" class="badge-bg"/>
+  <text x="1355" y="202" class="badge">你的增强</text>
+  <text x="1042" y="213" class="box-title">Tenant Identity &amp; Security Middleware</text>
+  <text x="1042" y="237" class="box-sub">API Key → tenant_id，贯穿会话、文件与执行</text>
+  <rect x="1042" y="251" width="86" height="18" rx="4" class="tag-bg"/><text x="1052" y="264" class="tag">租户所有权</text>
+  <rect x="1134" y="251" width="86" height="18" rx="4" class="tag-bg"/><text x="1144" y="264" class="tag">跨租户拒绝</text>
+  <rect x="1226" y="251" width="96" height="18" rx="4" class="tag-bg"/><text x="1236" y="264" class="tag">404 隐藏边界</text>
+
+  <!-- layer connector -->
+  <path d="M800 300 V342" class="line"/>
+  <text x="817" y="329" class="flow">原子准入</text>
+
+  <!-- Layer 2 -->
+  <rect x="48" y="344" width="1504" height="178" rx="14" class="lane"/>
+  <text x="70" y="378" class="layer">02  配额与执行编排层</text>
+  <text x="278" y="378" class="layer-note">先决定是否准入，再管理完整执行生命周期</text>
+
+  <rect x="90" y="402" width="390" height="94" rx="9" class="mine"/>
+  <rect x="351" y="414" width="108" height="24" rx="12" class="badge-bg"/>
+  <text x="375" y="430" class="badge">你的增强</text>
+  <text x="112" y="431" class="box-title">TenantQuotaService</text>
+  <text x="112" y="454" class="box-sub">Redis Lua 原子清理、检查、计数与创建租约</text>
+  <text x="112" y="478" class="tag">并发上限 · 日调用量 · 执行时长 · HTTP 429</text>
+
+  <path d="M480 449 H590" class="line"/>
+  <text x="514" y="438" class="flow">quota lease</text>
+
+  <rect x="592" y="402" width="410" height="94" rx="9" class="box"/>
+  <text x="614" y="431" class="box-title">ExecutionOrchestrator</text>
+  <text x="614" y="454" class="box-sub">会话校验 → 文件装载 → 执行 → 状态保存 → 回收</text>
+  <text x="614" y="478" class="tag">finally 释放租约 · PTC 暂停续租 · 统一异常处理</text>
+
+  <path d="M1002 449 H1110" class="line"/>
+  <text x="1040" y="438" class="flow">events</text>
+
+  <rect x="1112" y="402" width="348" height="94" rx="9" class="box"/>
+  <text x="1134" y="431" class="box-title">Async Event Bus</text>
+  <text x="1134" y="454" class="box-sub">解耦执行、清理、指标与会话事件</text>
+  <text x="1134" y="478" class="tag">Started · Completed · SandboxAcquired</text>
+
+  <path d="M800 522 V564" class="line"/>
+  <text x="817" y="551" class="flow">申请执行容量</text>
+
+  <!-- Layer 3 -->
+  <rect x="48" y="566" width="1504" height="196" rx="14" class="lane"/>
+  <text x="70" y="600" class="layer">03  沙箱数据面</text>
+  <text x="225" y="600" class="layer-note">调度与执行分离，nsjail 承担真正的安全边界</text>
+
+  <rect x="90" y="626" width="410" height="106" rx="9" class="mine"/>
+  <rect x="371" y="638" width="108" height="24" rx="12" class="badge-bg"/>
+  <text x="395" y="654" class="badge">你的增强</text>
+  <text x="112" y="655" class="box-title">Adaptive Sandbox Pool</text>
+  <text x="112" y="679" class="box-sub">前台繁忙时延迟补池，动态调整目标并清理失效 REPL</text>
+  <text x="112" y="704" class="tag">pool hit/miss · in_use · pending · target_size</text>
+
+  <path d="M500 679 H590" class="line"/>
+  <text x="522" y="668" class="flow">acquire</text>
+
+  <rect x="592" y="626" width="390" height="106" rx="9" class="box"/>
+  <text x="614" y="655" class="box-title">Execution Runner</text>
+  <text x="614" y="679" class="box-sub">Python REPL 与标准多语言执行路径</text>
+  <rect x="614" y="696" width="94" height="18" rx="4" class="tag-bg"/><text x="624" y="709" class="tag">REPLExecutor</text>
+  <rect x="714" y="696" width="112" height="18" rx="4" class="tag-bg"/><text x="724" y="709" class="tag">SandboxExecutor</text>
+  <rect x="832" y="696" width="116" height="18" rx="4" class="tag-bg"/><text x="842" y="709" class="tag">OutputProcessor</text>
+
+  <path d="M982 679 H1072" class="line"/>
+  <text x="1007" y="668" class="flow">stdio</text>
+
+  <rect x="1074" y="626" width="386" height="106" rx="9" class="box"/>
+  <text x="1096" y="655" class="box-title">nsjail Sandbox</text>
+  <text x="1096" y="679" class="box-sub">隔离 PID、挂载、网络、系统调用与资源</text>
+  <text x="1096" y="704" class="tag">namespace · seccomp · cgroup · timeout · 13 languages</text>
+
+  <!-- layer 4 connections -->
+  <path d="M620 732 V810" class="data-line"/>
+  <path d="M980 732 V810" class="data-line"/>
+  <text x="754" y="788" class="flow">会话状态、输入文件与执行产物</text>
+
+  <!-- Layer 4 -->
+  <rect x="48" y="812" width="1504" height="170" rx="14" class="lane"/>
+  <text x="70" y="846" class="layer">04  状态、存储与恢复</text>
+  <text x="278" y="846" class="layer-note">跨进程共享状态，同时维持租户所有权</text>
+
+  <rect x="90" y="870" width="400" height="86" rx="9" class="box"/>
+  <text x="112" y="899" class="box-title">Redis</text>
+  <text x="112" y="922" class="box-sub">会话元数据、配额租约、速率限制、运行状态</text>
+  <text x="112" y="943" class="tag">SessionService · TenantQuota · StateService</text>
+
+  <rect x="600" y="870" width="400" height="86" rx="9" class="box"/>
+  <text x="622" y="899" class="box-title">S3-Compatible Storage</text>
+  <text x="622" y="922" class="box-sub">Garage / MinIO / S3 保存输入、产物与归档</text>
+  <text x="622" y="943" class="tag">FileService · StateArchive · tenant ownership</text>
+
+  <rect x="1110" y="860" width="350" height="106" rx="9" class="mine"/>
+  <rect x="1330" y="872" width="108" height="24" rx="12" class="badge-bg"/>
+  <text x="1354" y="888" class="badge">你的强化</text>
+  <text x="1132" y="899" class="box-title">Cleanup &amp; Recovery</text>
+  <text x="1132" y="922" class="box-sub">租约过期、孤儿资源、暂停上下文和失效 REPL 回收</text>
+  <text x="1132" y="947" class="tag">TTL · lease expiry · dead REPL prune</text>
+
+  <!-- Layer 5 -->
+  <rect x="48" y="1004" width="1504" height="164" rx="14" class="lane"/>
+  <text x="70" y="1038" class="layer">05  可观测性与性能验证</text>
+  <text x="311" y="1038" class="layer-note">把性能优化变成可复现的工程证据</text>
+
+  <rect x="90" y="1060" width="350" height="78" rx="9" class="mine"/>
+  <text x="112" y="1089" class="box-title">Runtime Observability</text>
+  <text x="112" y="1113" class="box-sub">池来源、负载、健康状态和执行延迟</text>
+  <text x="112" y="1131" class="tag">pool_hit/miss · in_use · pending</text>
+
+  <rect x="458" y="1060" width="350" height="78" rx="9" class="mine"/>
+  <text x="480" y="1089" class="box-title">Benchmark Harness</text>
+  <text x="480" y="1113" class="box-sub">吞吐、尾延迟、429、CPU 与内存</text>
+  <text x="480" y="1131" class="tag">RPS · p50/p95/p99 · Docker metrics</text>
+
+  <rect x="830" y="1060" width="160" height="78" rx="8" class="metric-bg"/>
+  <text x="850" y="1085" class="metric-name">吞吐</text><text x="850" y="1117" class="metric-value">+11.28%</text>
+  <rect x="1004" y="1060" width="160" height="78" rx="8" class="metric-bg"/>
+  <text x="1024" y="1085" class="metric-name">p95 延迟</text><text x="1024" y="1117" class="metric-value">-32.09%</text>
+  <rect x="1178" y="1060" width="160" height="78" rx="8" class="metric-bg"/>
+  <text x="1198" y="1085" class="metric-name">p99 延迟</text><text x="1198" y="1117" class="metric-value">-32.17%</text>
+  <rect x="1352" y="1060" width="160" height="78" rx="8" class="metric-bg"/>
+  <text x="1372" y="1085" class="metric-name">内存</text><text x="1372" y="1117" class="metric-value">-34.11%</text>
+
+  <text x="70" y="1198" class="foot">主链路：请求 → 租户身份 → 原子配额 → 执行编排 → 自适应沙箱池 → nsjail → 状态与产物 → 指标</text>
+  <text x="1248" y="1198" class="foot">基于 LibreCodeInterpreter 二次开发</text>
+</svg>

@@ -95,9 +95,15 @@ class ConcurrencyTestResult:
     failed_requests: int = 0
     latencies: List[float] = field(default_factory=list)
     errors: Dict[str, int] = field(default_factory=dict)
+    status_codes: Dict[int, int] = field(default_factory=dict)
     duration_seconds: float = 0.0
     system_metrics: SystemMetrics = field(default_factory=SystemMetrics)
     sandbox_stats: Optional[SandboxStats] = None
+    pool_hits: int = 0
+    pool_misses: int = 0
+    pool_exhaustion_events: int = 0
+    container_sources: Dict[str, int] = field(default_factory=dict)
+    container_source_latencies: Dict[str, List[float]] = field(default_factory=dict)
 
     @property
     def success_rate(self) -> float:
@@ -157,7 +163,29 @@ class ConcurrencyTestResult:
             return 0.0
         return max(self.latencies)
 
+    @property
+    def quota_rejections(self) -> int:
+        """Requests deliberately rejected by tenant quota enforcement."""
+        return self.status_codes.get(429, 0)
+
+    @property
+    def pool_hit_rate(self) -> float:
+        total = self.pool_hits + self.pool_misses
+        if total == 0:
+            return 0.0
+        return self.pool_hits / total * 100
+
     def to_dict(self) -> Dict[str, Any]:
+        source_latency = {}
+        for source, values in sorted(self.container_source_latencies.items()):
+            ordered = sorted(values)
+            p95_index = min(int(len(ordered) * 0.95), len(ordered) - 1)
+            source_latency[source] = {
+                "count": len(values),
+                "avg_ms": round(statistics.mean(values), 2),
+                "p50_ms": round(statistics.median(values), 2),
+                "p95_ms": round(ordered[p95_index], 2),
+            }
         result = {
             "concurrency": self.concurrency,
             "scenario_id": self.scenario_id,
@@ -177,6 +205,18 @@ class ConcurrencyTestResult:
                 "max_ms": round(self.max_latency_ms, 2),
             },
             "errors": self.errors,
+            "status_codes": {
+                str(code): count for code, count in sorted(self.status_codes.items())
+            },
+            "quota_rejections": self.quota_rejections,
+            "pool": {
+                "hits": self.pool_hits,
+                "misses": self.pool_misses,
+                "hit_rate": round(self.pool_hit_rate, 2),
+                "exhaustion_events": self.pool_exhaustion_events,
+            },
+            "container_sources": dict(sorted(self.container_sources.items())),
+            "container_source_latency": source_latency,
             "system_metrics": self.system_metrics.to_dict(),
         }
         if self.sandbox_stats:
@@ -289,6 +329,8 @@ class LoadTestConfig:
     timeout_seconds: int = 60
     monitor_interval_seconds: float = 1.0
     enable_sandbox_stats: bool = True
+    enable_vm_sizing: bool = False
+    server_container: Optional[str] = None
     output_dir: str = "./load_test_results"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -303,6 +345,8 @@ class LoadTestConfig:
             "timeout_seconds": self.timeout_seconds,
             "monitor_interval_seconds": self.monitor_interval_seconds,
             "enable_sandbox_stats": self.enable_sandbox_stats,
+            "enable_vm_sizing": self.enable_vm_sizing,
+            "server_container": self.server_container,
             "output_dir": self.output_dir,
         }
 

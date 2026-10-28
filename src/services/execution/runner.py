@@ -74,7 +74,10 @@ class CodeExecutionRunner:
             )
             try:
                 sandbox_info = await self.sandbox_pool.acquire(language, session_id)
-                return sandbox_info, "pool_hit"
+                # acquire() can fall back to a freshly created sandbox when
+                # the queue is empty. Keep that distinction observable.
+                source = sandbox_info.labels.get("pool_source", "pool_miss")
+                return sandbox_info, source
             except Exception as e:
                 logger.warning(
                     "Pool acquire failed, falling back to fresh sandbox",

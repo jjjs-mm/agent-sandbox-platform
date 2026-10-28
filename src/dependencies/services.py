@@ -12,6 +12,7 @@ import structlog
 from ..services import FileService, SessionService, CodeExecutionService
 from ..services.state import StateService
 from ..services.state_archival import StateArchivalService
+from ..services.tenant_quota import TenantQuotaService
 from ..services.interfaces import (
     FileServiceInterface,
     SessionServiceInterface,
@@ -56,6 +57,12 @@ def get_state_archival_service() -> StateArchivalService:
     """Get state archival service instance for S3 cold storage."""
     state_service = get_state_service()
     return StateArchivalService(state_service=state_service)
+
+
+@lru_cache()
+def get_tenant_quota_service() -> TenantQuotaService:
+    """Get the shared Redis-backed tenant quota service."""
+    return TenantQuotaService()
 
 
 @lru_cache()
@@ -113,3 +120,4 @@ StateServiceDep = Annotated[StateService, Depends(get_state_service)]
 StateArchivalServiceDep = Annotated[
     StateArchivalService, Depends(get_state_archival_service)
 ]
+TenantQuotaServiceDep = Annotated[TenantQuotaService, Depends(get_tenant_quota_service)]

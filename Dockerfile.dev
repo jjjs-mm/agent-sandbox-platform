@@ -1,0 +1,8 @@
+# Fast local image for validating application-only changes.
+# The published image supplies nsjail and all language runtimes; this layer
+# replaces only the Python API source from the current checkout.
+ARG BASE_IMAGE=ghcr.io/usnavy13/librecodeinterpreter:main
+FROM ${BASE_IMAGE}
+
+COPY src/ /app/src/
+

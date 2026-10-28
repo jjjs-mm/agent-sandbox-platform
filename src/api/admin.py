@@ -1,6 +1,7 @@
 """Admin API endpoints for dashboard."""
 
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -13,8 +14,10 @@ from pydantic import BaseModel, Field
 from ..config import settings
 from ..dependencies.auth import verify_master_key
 from ..services.api_key_manager import get_api_key_manager
+from ..services.tenant_quota import TenantQuotaLimits
 from ..services.metrics import metrics_service as unified_metrics
 from ..services.health import health_service
+from ..dependencies.services import get_tenant_quota_service
 from ..models.api_key import RateLimits as RateLimitsModel
 
 logger = structlog.get_logger(__name__)
@@ -37,6 +40,12 @@ class ApiKeyCreate(BaseModel):
     name: str = Field(..., min_length=1)
     rate_limits: Optional[RateLimitsUpdate] = None
     metadata: Optional[Dict[str, str]] = None
+    tenant_id: str = Field(
+        default="default",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
 
 
 class ApiKeyUpdate(BaseModel):
@@ -50,12 +59,30 @@ class ApiKeyResponse(BaseModel):
     key_prefix: str
     name: str
     created_at: datetime
+    tenant_id: str = "default"
     enabled: bool
     rate_limits: Dict[str, Optional[int]]
     metadata: Dict[str, str]
     last_used_at: Optional[datetime] = None
     usage_count: int
     source: str = "managed"  # "managed" or "environment"
+
+
+class TenantQuotaStatusResponse(BaseModel):
+    tenant_id: str
+    enabled: bool
+    active_executions: int
+    daily_executions: int
+    daily_execution_seconds: float
+    limits: Dict[str, int]
+    customized: bool
+    resets_at: datetime
+
+
+class TenantQuotaUpdate(BaseModel):
+    max_concurrent_executions: int = Field(..., ge=1, le=1000)
+    daily_execution_limit: int = Field(..., ge=1, le=10_000_000)
+    daily_execution_seconds: int = Field(..., ge=1, le=31_536_000)
 
 
 # --- Endpoints ---
@@ -73,6 +100,7 @@ async def list_keys(_: str = Depends(verify_master_key)):
             key_prefix=r.key_prefix,
             name=r.name,
             created_at=r.created_at,
+            tenant_id=r.tenant_id,
             enabled=r.enabled,
             rate_limits=r.rate_limits.to_dict(),
             metadata=r.metadata,
@@ -100,7 +128,10 @@ async def create_key(data: ApiKeyCreate, _: str = Depends(verify_master_key)):
         )
 
     full_key, record = await manager.create_key(
-        name=data.name, rate_limits=rate_limits, metadata=data.metadata
+        name=data.name,
+        rate_limits=rate_limits,
+        metadata=data.metadata,
+        tenant_id=data.tenant_id,
     )
 
     return {
@@ -110,6 +141,7 @@ async def create_key(data: ApiKeyCreate, _: str = Depends(verify_master_key)):
             key_prefix=record.key_prefix,
             name=record.name,
             created_at=record.created_at,
+            tenant_id=record.tenant_id,
             enabled=record.enabled,
             rate_limits=record.rate_limits.to_dict(),
             metadata=record.metadata,
@@ -210,6 +242,53 @@ async def get_admin_stats(
         "period_hours": hours,
         "timestamp": now.isoformat(),
     }
+
+
+@router.get(
+    "/tenants/{tenant_id}/quota",
+    response_model=TenantQuotaStatusResponse,
+    summary="Inspect aggregate tenant quota usage",
+)
+async def get_tenant_quota_status(
+    tenant_id: str,
+    _: str = Depends(verify_master_key),
+):
+    """Return live execution quota usage shared by all keys for a tenant."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", tenant_id):
+        raise HTTPException(status_code=422, detail="Invalid tenant_id")
+    return await get_tenant_quota_service().get_status(tenant_id)
+
+
+@router.put(
+    "/tenants/{tenant_id}/quota",
+    response_model=TenantQuotaStatusResponse,
+    summary="Configure tenant-specific execution quotas",
+)
+async def update_tenant_quota(
+    tenant_id: str,
+    data: TenantQuotaUpdate,
+    _: str = Depends(verify_master_key),
+):
+    """Override the default execution quotas for one tenant."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", tenant_id):
+        raise HTTPException(status_code=422, detail="Invalid tenant_id")
+    limits = TenantQuotaLimits(**data.model_dump())
+    return await get_tenant_quota_service().set_limits(tenant_id, limits)
+
+
+@router.delete(
+    "/tenants/{tenant_id}/quota",
+    response_model=TenantQuotaStatusResponse,
+    summary="Reset tenant execution quotas",
+)
+async def reset_tenant_quota(
+    tenant_id: str,
+    _: str = Depends(verify_master_key),
+):
+    """Remove tenant overrides and restore environment defaults."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", tenant_id):
+        raise HTTPException(status_code=422, detail="Invalid tenant_id")
+    return await get_tenant_quota_service().reset_limits(tenant_id)
 
 
 @router.get("/skill-deps", summary="Inspect persistent skill-deps cache")

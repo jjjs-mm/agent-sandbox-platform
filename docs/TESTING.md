@@ -79,6 +79,53 @@ API_KEY="your-secure-api-key-here-change-this-in-production" \
 pytest tests/functional/ -m client_replay -v
 ```
 
+### Multi-Tenant File Isolation
+
+This live test creates two temporary managed API keys, assigns them to
+different tenants, and verifies that tenant B cannot list, download, inspect,
+or execute with a file uploaded by tenant A. The keys are revoked during test
+cleanup.
+
+```bash
+API_BASE="http://localhost:8000" \
+MASTER_API_KEY="your-secure-master-key" \
+pytest tests/functional/test_tenant_file_isolation.py -v
+```
+
+The running API must be built from the current checkout; the published image
+does not contain uncommitted local tenant-isolation changes.
+
+For a fast application-only rebuild, reuse the published runtime image and
+overlay the current `src/` directory:
+
+```bash
+MASTER_API_KEY="local-e2e-master-key" \
+docker compose -f docker-compose.yml -f docker-compose.e2e.yml \
+  up --build -d
+
+API_BASE="http://localhost:8000" \
+MASTER_API_KEY="local-e2e-master-key" \
+pytest tests/functional/test_tenant_file_isolation.py -v
+```
+
+`Dockerfile.dev` is only an iteration image. Use the main multi-stage
+`Dockerfile` for release and runtime-layer changes.
+
+### Tenant Quota Atomicity
+
+The quota tests use a real local Redis instance. The race case launches ten
+coroutines against a tenant with one available slot, where exactly one request
+must win. A second case verifies that a tenant override takes precedence over
+environment defaults and that deleting it restores those defaults.
+
+```bash
+docker compose up -d redis
+RUN_REDIS_TESTS=1 \
+pytest tests/functional/test_tenant_quota_redis.py -v
+```
+
+The normal test suite skips this test because it requires external Redis.
+
 ### Marker-Based Runs
 
 ```bash

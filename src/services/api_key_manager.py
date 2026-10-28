@@ -216,6 +216,7 @@ class ApiKeyManagerService:
         name: str,
         rate_limits: Optional[RateLimits] = None,
         metadata: Optional[Dict[str, str]] = None,
+        tenant_id: str = "default",
     ) -> Tuple[str, ApiKeyRecord]:
         """Create a new API key.
 
@@ -223,6 +224,7 @@ class ApiKeyManagerService:
             name: Human-readable name for the key
             rate_limits: Optional rate limits (default: unlimited)
             metadata: Optional metadata dict
+            tenant_id: Tenant that owns this key (default for legacy callers)
 
         Returns:
             Tuple of (full_api_key, ApiKeyRecord)
@@ -238,6 +240,7 @@ class ApiKeyManagerService:
             key_prefix=full_key[:11],  # "sk-" + first 8 chars
             name=name,
             created_at=datetime.now(timezone.utc),
+            tenant_id=tenant_id,
             enabled=True,
             rate_limits=rate_limits or RateLimits(),
             metadata=metadata or {},
